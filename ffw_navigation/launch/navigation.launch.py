@@ -68,7 +68,7 @@ def generate_launch_description():
     localization_params_path = os.path.join(
         pkg_navigation,
         'config',
-        'amcl_localization.yaml'
+        'amcl_localization_test.yaml'
     )
 
     navigation_params_path = os.path.join(
