@@ -7,22 +7,42 @@ endif()
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
-# uncomment the following section in order to fill in
-# further dependencies manually.
-# find_package(<dependency> REQUIRED)
+find_package(behaviortree_cpp REQUIRED) # Jazzy (v4)
+find_package(nav_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(rclcpp REQUIRED)
 
-if(BUILD_TESTING)
-  find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # comment the line when a copyright and license is added to all source files
-  set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # comment the line when this package is in a git repo and when
-  # a copyright and license is added to all source files
-  set(ament_cmake_cpplint_FOUND TRUE)
-  ament_lint_auto_find_test_dependencies()
-endif()
+# 라이브러리 추가
+add_library(is_path_length_under_plugin SHARED
+  src/is_path_length_under.cpp
+)
 
+# Include 디렉토리 설정
+target_include_directories(is_path_length_under_plugin PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+# ★ 변경 추천: ament_target_dependencies 사용
+# 이렇게 하면 include 경로와 라이브러리 링킹을 자동으로 처리해줍니다.
+# nav_msgs__rosidl_typesupport_cpp 처럼 길게 안 써도 됩니다.
+ament_target_dependencies(is_path_length_under_plugin
+  behaviortree_cpp
+  nav_msgs
+  geometry_msgs
+  rclcpp
+)
+
+# Install 규칙 (라이브러리)
+install(TARGETS is_path_length_under_plugin
+  EXPORT export_is_path_length_under_plugin
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+
+# Install 규칙 (디렉토리)
+# launch, config 등의 폴더가 실제로 존재하는지 꼭 확인하세요.
 install(DIRECTORY
   launch
   rviz
@@ -30,5 +50,11 @@ install(DIRECTORY
   maps
   DESTINATION share/${PROJECT_NAME}
 )
+
+target_compile_definitions(is_path_length_under_plugin PRIVATE BT_PLUGIN_EXPORT)
+
+# Export 설정
+ament_export_libraries(is_path_length_under_plugin)
+ament_export_dependencies(behaviortree_cpp nav_msgs geometry_msgs rclcpp)
 
 ament_package()
