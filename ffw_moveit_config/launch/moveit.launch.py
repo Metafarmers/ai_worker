@@ -59,17 +59,31 @@ def generate_launch_description():
     warehouse_sqlite_path = LaunchConfiguration('warehouse_sqlite_path')
     publish_robot_description_semantic = LaunchConfiguration('publish_robot_description_semantic')
 
+        
+    urdf_xacro = PathJoinSubstitution([
+        FindPackageShare("ffw_description"),
+        "urdf",
+        "ffw_sg2_rev1_follower",
+        "ffw_sg2_follower.urdf.xacro",
+    ])
+
     moveit_config = (
-        MoveItConfigsBuilder(robot_name='ffw', package_name='ffw_moveit_config')
-        .robot_description_semantic(Path('config') / 'ffw.srdf')
+        MoveItConfigsBuilder(robot_name="ffw", package_name="ffw_moveit_config")
+        .robot_description_semantic(file_path="config/ffw.srdf")
+        .joint_limits(str(Path('config') / 'joint_limits.yaml'))
+        .trajectory_execution(str(Path('config') / 'moveit_controllers.yaml'))
+        .robot_description_kinematics(str(Path('config') / 'kinematics.yaml'))
+        .planning_scene_monitor(publish_robot_description=True, publish_robot_description_semantic=True)
         .to_moveit_configs()
     )
+
 
     warehouse_ros_config = {
         'warehouse_plugin': 'warehouse_ros_sqlite::DatabaseConnection',
         'warehouse_host': warehouse_sqlite_path,
     }
 
+    
     move_group_node = Node(
         package='moveit_ros_move_group',
         executable='move_group',
