@@ -3,7 +3,7 @@
     This is a format for representing semantic information about the robot structure.
     A URDF file must exist for this robot as well, where the joints and the links that are referenced are defined
 -->
-<robot name="ffw_bg2_follower">
+<robot name="ffw_sg2_follower">
     <!--GROUPS: Representation of a set of joints and links. This can be useful for specifying DOF to plan for, defining arms, end effectors, etc-->
     <!--LINKS: When a link is specified, the parent joint of that link (if it exists) is automatically included-->
     <!--JOINTS: When a joint is specified, the child link of that joint (which will always exist) is automatically included-->
@@ -17,7 +17,7 @@
         <joint name="arm_l_joint5"/>
         <joint name="arm_l_joint6"/>
         <joint name="arm_l_joint7"/>
-        <joint name="end_effector_l_joint"/>
+        <!-- <joint name="end_effector_l_joint"/> -->
     </group>
     <group name="arm_r">
         <joint name="arm_r_joint1"/>
@@ -27,7 +27,7 @@
         <joint name="arm_r_joint5"/>
         <joint name="arm_r_joint6"/>
         <joint name="arm_r_joint7"/>
-        <joint name="end_effector_r_joint"/>
+        <!-- <joint name="end_effector_r_joint"/> -->
     </group>
     <group name="head">
         <joint name="head_joint1"/>
