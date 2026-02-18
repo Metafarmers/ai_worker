@@ -11,7 +11,7 @@
         - arm_l_joint7
         - gripper_l_joint1
       step_names: [home]
-      home: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      home: [0.0, 0.0, 0.0, -1.5708, 0.0, 0.0, 0.0, 0.0]
       duration: 5.0
       position_tolerance: 0.1
       velocity_tolerance: 0.01
@@ -31,7 +31,7 @@
         - arm_r_joint7
         - gripper_r_joint1
       step_names: [home]
-      home: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      home: [0.0, 0.0, 0.0, -1.5708, 0.0, 0.0, 0.0, 0.0]
       duration: 5.0
       position_tolerance: 0.1
       velocity_tolerance: 0.01
