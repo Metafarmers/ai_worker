@@ -850,8 +850,8 @@ class Gr00tEndPoseRelServoNode(Node):
             else 1
         )
         if self.action_buffer_index >= actual_chunk_size:
-            self.action_buffer_index = 0
-
+            # self.action_buffer_index = 0
+            return
         idx = min(self.action_buffer_index, actual_chunk_size - 1)
 
         delta_left = self.action_buffer.rel_end_pose_left[idx].flatten()

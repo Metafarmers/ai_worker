@@ -8,8 +8,8 @@ moveit_servo:
   publish_period: 0.02            # 50 Hz output rate
   max_expected_latency: 0.1
   move_group_name: "arm_r"
-  planning_frame: "arm_r_joint1"
-  ee_frame_name: "arm_r_joint7"
+  planning_frame: "arm_r_link1"
+  ee_frame_name: "arm_r_link7"
   active_subgroup: ""
 
   ## Incoming command settings

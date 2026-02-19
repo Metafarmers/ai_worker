@@ -8,8 +8,8 @@ moveit_servo:
   publish_period: 0.02            # 50 Hz output rate
   max_expected_latency: 0.1
   move_group_name: "arm_l"
-  planning_frame: "arm_l_joint1"
-  ee_frame_name: "arm_l_joint7"
+  planning_frame: "arm_l_link1"
+  ee_frame_name: "arm_l_link7"
   active_subgroup: ""
 
   ## Incoming command settings
@@ -57,7 +57,7 @@ moveit_servo:
   collision_check_rate: 10.0
 
   ## Singularity
-  lower_singularity_threshold: 17.0
+  lower_singularity_threshold: 1.0
   hard_stop_singularity_threshold: 30.0
   leaving_singularity_threshold_multiplier: 2.0
   singularity_step_scale: 0.01
