@@ -57,7 +57,7 @@ moveit_servo:
   collision_check_rate: 10.0
 
   ## Singularity — threshold 낮추면 특이점 근처에서도 속도가 덜 잘리어 움직임 가능 (안전 주의)
-  lower_singularity_threshold: 0.005
+  lower_singularity_threshold: 0.001
   hard_stop_singularity_threshold: 30.0
   leaving_singularity_threshold_multiplier: 2.0
   singularity_step_scale: 0.01

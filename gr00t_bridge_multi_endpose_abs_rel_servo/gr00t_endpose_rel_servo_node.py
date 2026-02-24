@@ -924,7 +924,7 @@ class Gr00tEndPoseRelServoNode(Node):
             else 1
         )
         # Use idx+1 so we apply delta_curr_to_next (action[i+1] = pose[i+1]-pose[i])
-        idx = self.action_buffer_index + 1
+        idx = self.action_buffer_index
         if idx >= actual_chunk_size:
             return
 
