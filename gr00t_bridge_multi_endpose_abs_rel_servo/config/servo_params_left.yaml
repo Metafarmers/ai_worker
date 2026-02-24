@@ -17,11 +17,11 @@ moveit_servo:
   cartesian_command_in_topic: "~/delta_twist_cmds"
   joint_command_in_topic: "~/delta_joint_cmds"
   command_in_type: "speed_units"
-  incoming_command_timeout: 0.3
+  incoming_command_timeout: 1.0   # 0.3 can drop commands between inference cycles
 
   scale:
-    linear: 0.1                   # m/s — 첫 테스트용 보수적 값 (원래 0.4)
-    rotational: 0.2               # rad/s — 첫 테스트용 보수적 값 (원래 0.8)
+    linear: 0.2                   # m/s — 동작 확인용 (특이점에서도 소폭 움직임 나오도록)
+    rotational: 0.4                # rad/s
     joint: 0.5
 
   ## Twist settings
@@ -56,8 +56,8 @@ moveit_servo:
   scene_collision_proximity_threshold: 0.02
   collision_check_rate: 10.0
 
-  ## Singularity
-  lower_singularity_threshold: 1.0
+  ## Singularity — threshold 낮추면 특이점 근처에서도 속도가 덜 잘리어 움직임 가능 (안전 주의)
+  lower_singularity_threshold: 0.005
   hard_stop_singularity_threshold: 30.0
   leaving_singularity_threshold_multiplier: 2.0
   singularity_step_scale: 0.01
@@ -66,5 +66,5 @@ moveit_servo:
   halt_all_joints_in_joint_mode: true
   halt_all_joints_in_cartesian_mode: true
   joint_limit_margins: [0.1]
-  override_velocity_scaling_factor: 0.0
-  wait_for_initial_state_timeout: 0.0
+  override_velocity_scaling_factor: 1.0
+  wait_for_initial_state_timeout: 10.0

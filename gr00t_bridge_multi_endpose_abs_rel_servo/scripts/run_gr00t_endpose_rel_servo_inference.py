@@ -56,7 +56,8 @@ Prerequisites:
 
     parser.add_argument(
         "--checkpoint", type=str,
-        default="/Isaac-GR00T/results/260214_endpose_abs_rel/checkpoint-1000",
+        default="/Isaac-GR00T/results/260222_bugfix_abs_rel/checkpoint-1000",
+        # default="/Isaac-GR00T/results/260214_endpose_abs_rel_1frame_shift/checkpoint-7000",
         help="Path to GR00T end-pose relative action checkpoint",
     )
     parser.add_argument("--embodiment", type=str, default="new_embodiment")
@@ -65,6 +66,8 @@ Prerequisites:
 
     parser.add_argument("--dry-run", action="store_true", default=False)
     parser.add_argument("--publish", action="store_true", default=False)
+    parser.add_argument("--step-by-step", action="store_true", default=False,
+                        help="Wait for Enter key before each inference step (safe for real robot)")
     parser.add_argument("--task", type=str, default="Execute the task")
 
     parser.add_argument(
@@ -124,6 +127,7 @@ def main():
     print(f"  Device: {args.device}")
     print(f"  Inference rate: {args.rate} Hz")
     print(f"  Dry-run mode: {dry_run}")
+    print(f"  Step-by-step: {args.step_by_step}")
     print(f"  Use sim time: {args.use_sim_time}")
     print(f"  Action horizon: {args.action_horizon}")
     print("-" * 70)
@@ -172,6 +176,7 @@ def main():
             Parameter("action_horizon_execute", Parameter.Type.INTEGER, int(args.action_horizon_execute)),
             Parameter("action_horizon_step_delay", Parameter.Type.DOUBLE, float(args.action_horizon_step_delay)),
             Parameter("gripper_step_duration_sec", Parameter.Type.DOUBLE, float(args.gripper_step_duration)),
+            Parameter("step_by_step", Parameter.Type.BOOL, args.step_by_step),
         ]
 
         if args.use_sim_time:
@@ -185,6 +190,8 @@ def main():
         print("[INFO] Required: 3 cameras + 2 end-poses + joint states")
         print("[INFO] Make sure MoveIt Servo is running:")
         print("[INFO]   ros2 launch gr00t_bridge_multi_endpose_abs_rel_servo servo_dual_arm.launch.py")
+        if args.step_by_step:
+            print("[INFO] *** STEP-BY-STEP MODE: Press Enter to execute each inference step ***")
         print("[INFO] Press Ctrl+C to stop\n")
 
         rclpy.spin(inference_node)

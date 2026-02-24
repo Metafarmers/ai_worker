@@ -64,6 +64,11 @@ def generate_launch_description():
             default_value='ffw_sg2_follower',
             description='Type of ros2_control',
         ),
+        DeclareLaunchArgument(
+            'use_sim_time',
+            default_value='false',
+            description='Use simulation time from /clock topic (for bag replay --clock).',
+        ),
     ]
 
     start_rviz = LaunchConfiguration('start_rviz')
@@ -78,6 +83,7 @@ def generate_launch_description():
     use_head_eef_tracker = LaunchConfiguration('use_head_eef_tracker')
     init_position_file = LaunchConfiguration('init_position_file')
     ros2_control_type = LaunchConfiguration('ros2_control_type')
+    use_sim_time = LaunchConfiguration('use_sim_time')
 
     robot_description_content = Command([
         PathJoinSubstitution([FindExecutable(name='xacro')]),
@@ -123,7 +129,7 @@ def generate_launch_description():
     robot_state_pub_node = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
-        parameters=[robot_description, {'use_sim_time': use_sim}],
+        parameters=[robot_description, {'use_sim_time': use_sim_time}],
         output='screen'
     )
 
@@ -346,7 +352,7 @@ def generate_launch_description():
             'enable_shadow_filter': True,
             'enable_average_filter': True,
         }, {
-            'use_sim_time': use_sim,
+            'use_sim_time': use_sim_time,
         }],
     )
 

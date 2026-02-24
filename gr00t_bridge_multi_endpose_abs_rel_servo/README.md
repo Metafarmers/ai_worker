@@ -91,3 +91,18 @@ Gripper → JointTrajectory (별도, allow_partial_joints_goal=true)
 | `--action-horizon-execute` | `4` | 실행할 스텝 수 |
 | `--dry-run` | (flag) | 동작 없이 추론만 수행 |
 | `--publish` | (flag) | 실제 Servo에 publish |
+
+## Servo 경고: Joint limit / Singularity
+
+다음 경고가 반복되면 Servo가 **동작은 하되** 목표 포즈가 조인트 한계/특이점에 걸린 상태입니다.
+
+- **`Joint position limit reached on joints: arm_l_joint2`** (또는 arm_r_joint2)  
+  - IK 해가 해당 조인트의 **position limit**를 넘어가려 함.  
+  - MoveIt은 `ffw_moveit_config/config/joint_limits.yaml`에서 limit 적용 (arm_l_joint2: 약 [0, π], arm_r_joint2: 약 [-π, 0]).  
+  - **대응**:  
+    - 실제 로봇 허용 범위가 더 넓다면 `joint_limits.yaml`의 `min_position`/`max_position`을 완화.  
+    - 또는 `config/servo_params_*.yaml`에서 `scale.linear` / `scale.rotational`을 더 줄이면 명령이 완만해져서 limit에 덜 걸릴 수 있음.
+
+- **`Moving away from a singularity, decelerating`** / **`Moving closer to a singularity, decelerating`**  
+  - End-effector가 **특이점 근처**라서 Servo가 자동으로 속도를 줄이는 정상 동작.  
+  - 제어는 계속되며, 필요 시 `config/servo_params_*.yaml`의 `singularity_step_scale`(기본 0.01)로 감속 강도 조절 가능.

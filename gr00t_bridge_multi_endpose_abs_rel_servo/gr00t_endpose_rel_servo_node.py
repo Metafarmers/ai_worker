@@ -31,6 +31,7 @@
 #   Grippers: absolute values published as separate JointTrajectory
 
 import sys
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import numpy as np
@@ -44,10 +45,11 @@ from rclpy.node import Node
 from rclpy.time import Time
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import CompressedImage, JointState
-from geometry_msgs.msg import PoseStamped, Pose
+from geometry_msgs.msg import PoseStamped, Pose, TransformStamped
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Float64
 from builtin_interfaces.msg import Duration
+import tf2_ros
 
 from moveit_msgs.srv import ServoCommandType
 from moveit_msgs.msg import ServoStatus
@@ -82,19 +84,19 @@ def apply_relative_action(current_pose: np.ndarray, delta_pose: np.ndarray) -> n
     """Convert a relative pose delta to an absolute target pose.
 
     target_pos  = current_pos + delta_pos
-    target_quat = current_quat * delta_quat  (normalized)
+    target_quat = delta_quat * current_quat  (data: delta = q_curr * q_prev⁻¹ → q_next = delta * q_tracking)
     """
     target_pos = current_pose[:3] + delta_pose[:3]
 
     current_quat = current_pose[3:7]
     delta_quat = delta_pose[3:7]
-    target_quat = quaternion_multiply(current_quat, delta_quat)
+    target_quat = quaternion_multiply(delta_quat, current_quat)
 
     quat_norm = np.linalg.norm(target_quat)
-    if quat_norm > 1e-8:
+    if quat_norm > 1e-6:
         target_quat = target_quat / quat_norm
     else:
-        target_quat = np.array([0.0, 0.0, 0.0, 1.0])
+        target_quat = current_quat.copy()
 
     return np.concatenate([target_pos, target_quat])
 
@@ -383,6 +385,13 @@ class Gr00tEndPoseRelServoNode(Node):
         self.action_horizon_step_delay = self.get_parameter("action_horizon_step_delay").value
 
         self.gripper_step_duration_sec = self.get_parameter("gripper_step_duration_sec").value
+        self.step_by_step = self.get_parameter("step_by_step").value
+
+        # Step-by-step gate: blocks inference until user presses Enter
+        self._step_approved = not self.step_by_step  # auto-approve if disabled
+        self._step_lock = threading.Lock()
+        if self.step_by_step:
+            self._start_step_input_thread()
 
         # State buffers
         self.latest_images: Dict[str, Optional[np.ndarray]] = {
@@ -428,6 +437,7 @@ class Gr00tEndPoseRelServoNode(Node):
         self._init_subscribers()
         self._init_servo_publishers()
         self._init_servo_service_clients()
+        self._init_tf_broadcaster()
 
         if not self.dry_run:
             self._init_gripper_publishers()
@@ -466,13 +476,14 @@ class Gr00tEndPoseRelServoNode(Node):
         self.declare_parameter("joint_state_topic", "/joint_states")
         self.declare_parameter("print_rate", 1.0)
 
-        self.declare_parameter("servo_left_ns", "servo_left")
-        self.declare_parameter("servo_right_ns", "servo_right")
+        self.declare_parameter("servo_left_ns", "servo_left/servo_node")
+        self.declare_parameter("servo_right_ns", "servo_right/servo_node")
 
         self.declare_parameter("action_horizon", 16)
         self.declare_parameter("action_horizon_execute", 4)
         self.declare_parameter("action_horizon_step_delay", 0.02)
         self.declare_parameter("gripper_step_duration_sec", 0.05)
+        self.declare_parameter("step_by_step", False)
 
     # =========================================================================
     # Initialization
@@ -594,6 +605,11 @@ class Gr00tEndPoseRelServoNode(Node):
             10,
         )
         self.get_logger().info("Gripper publishers initialized (separate from Servo)")
+
+    def _init_tf_broadcaster(self):
+        """Initialize TF broadcaster for target poses."""
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+        self.get_logger().info("TF broadcaster initialized for target poses")
 
     def _load_model(self):
         try:
@@ -741,9 +757,12 @@ class Gr00tEndPoseRelServoNode(Node):
     # =========================================================================
 
     def _publish_pose_to_servo(self, pose_array: np.ndarray, side: str):
-        """Create PoseStamped from pose_array and publish to Servo."""
+        """Create PoseStamped from pose_array and publish to Servo.
+        header.stamp = 0 so Servo does not treat the command as 'TF old' when clocks differ (e.g. cross-container).
+        """
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
+
         msg.header.frame_id = self.latest_end_pose_left.header.frame_id if side == "left" else self.latest_end_pose_right.header.frame_id
         msg.pose = self._pose_array_to_pose_msg(pose_array)
 
@@ -753,12 +772,12 @@ class Gr00tEndPoseRelServoNode(Node):
             self.pose_right_pub.publish(msg)
 
     def _publish_gripper_command(self, gripper_value: np.ndarray, side: str):
-        """Publish gripper-only JointTrajectory (separate from Servo arm control)."""
-        from builtin_interfaces.msg import Time as TimeMsg
-
+        """Publish gripper-only JointTrajectory (separate from Servo arm control).
+        Use current time for header.stamp so the controller does not reject as 'trajectory ends in the past'.
+        """
         msg = JointTrajectory()
         msg.header = Header()
-        msg.header.stamp = TimeMsg(sec=0, nanosec=0)
+        msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = ""
 
         if side == "left":
@@ -777,6 +796,45 @@ class Gr00tEndPoseRelServoNode(Node):
         else:
             self.gripper_right_pub.publish(msg)
 
+    def _broadcast_target_pose_tf(self, pose_array: np.ndarray, side: str, parent_frame_id: str):
+        """Broadcast target pose as TF transform for visualization in RViz."""
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = parent_frame_id
+        t.child_frame_id = f"target_pose_{side}"
+
+        t.transform.translation.x = float(pose_array[0])
+        t.transform.translation.y = float(pose_array[1])
+        t.transform.translation.z = float(pose_array[2])
+        t.transform.rotation.x = float(pose_array[3])
+        t.transform.rotation.y = float(pose_array[4])
+        t.transform.rotation.z = float(pose_array[5])
+        t.transform.rotation.w = float(pose_array[6])
+
+        self.tf_broadcaster.sendTransform(t)
+
+    # =========================================================================
+    # Step-by-step control
+    # =========================================================================
+
+    def _start_step_input_thread(self):
+        """Background thread that waits for Enter key to approve each inference step."""
+        def _input_loop():
+            while rclpy.ok():
+                try:
+                    input(
+                        "\n[STEP-BY-STEP] Press Enter to execute next inference "
+                        "(or 'q' + Enter to switch to continuous)... "
+                    )
+                except EOFError:
+                    break
+                with self._step_lock:
+                    if not self._step_approved:
+                        self._step_approved = True
+
+        t = threading.Thread(target=_input_loop, daemon=True)
+        t.start()
+
     # =========================================================================
     # Inference loop
     # =========================================================================
@@ -791,6 +849,13 @@ class Gr00tEndPoseRelServoNode(Node):
             if self.action_buffer is not None:
                 self._execute_action_from_buffer()
             return
+
+        # Step-by-step gate: skip this inference cycle until user approves
+        if self.step_by_step:
+            with self._step_lock:
+                if not self._step_approved:
+                    return
+                self._step_approved = False
 
         try:
             inference_start = time.time()
@@ -819,11 +884,8 @@ class Gr00tEndPoseRelServoNode(Node):
             self.tracking_pose_right = self._extract_pose_array(
                 self.latest_end_pose_right
             ).copy()
-
-            current_time = time.time()
-            if current_time - self.last_print_time >= 1.0 / self.print_rate:
-                self._print_action(action, inference_time)
-                self.last_print_time = current_time
+            
+            self._print_action(action, inference_time)
 
             num_execute = min(self.action_horizon_execute, 16)
             for i in range(num_execute):
@@ -831,13 +893,25 @@ class Gr00tEndPoseRelServoNode(Node):
                 if self.action_horizon_step_delay > 0 and i < num_execute - 1:
                     time.sleep(self.action_horizon_step_delay)
 
+            if self.step_by_step:
+                self.get_logger().info(
+                    f"[STEP] Executed {num_execute} actions. "
+                    "Press Enter for next inference..."
+                )
+
         except Exception as e:
             self.get_logger().error(f"Inference error: {e}")
             import traceback
             self.get_logger().error(traceback.format_exc())
 
     def _execute_action_from_buffer(self):
-        """Pop one action from the buffer, convert to absolute pose, publish to Servo."""
+        """Pop one action from the buffer, convert to absolute pose, publish to Servo.
+
+        1-frame shift fix (see analysis_gr00t_endpose_rel_servo_inference.md §11.3):
+        Data stores action[i] = pose[i] - pose[i-1] (delta that reached frame i).
+        For control we need delta_curr_to_next = pose[i+1] - pose[i], which is
+        stored at index i+1. So we use idx = action_buffer_index + 1.
+        """
         if self.action_buffer is None:
             return
         if self.tracking_pose_left is None or self.tracking_pose_right is None:
@@ -849,10 +923,10 @@ class Gr00tEndPoseRelServoNode(Node):
             if len(self.action_buffer.rel_end_pose_left.shape) > 1
             else 1
         )
-        if self.action_buffer_index >= actual_chunk_size:
-            # self.action_buffer_index = 0
+        # Use idx+1 so we apply delta_curr_to_next (action[i+1] = pose[i+1]-pose[i])
+        idx = self.action_buffer_index + 1
+        if idx >= actual_chunk_size:
             return
-        idx = min(self.action_buffer_index, actual_chunk_size - 1)
 
         delta_left = self.action_buffer.rel_end_pose_left[idx].flatten()
         gripper_l = self.action_buffer.gripper_l[idx].flatten()
@@ -864,6 +938,15 @@ class Gr00tEndPoseRelServoNode(Node):
 
         self.tracking_pose_left = target_pose_left.copy()
         self.tracking_pose_right = target_pose_right.copy()
+
+        # Broadcast TF for target poses (for RViz visualization)
+        if self.latest_end_pose_left is not None and self.latest_end_pose_right is not None:
+            self._broadcast_target_pose_tf(
+                target_pose_left, "left", self.latest_end_pose_left.header.frame_id
+            )
+            self._broadcast_target_pose_tf(
+                target_pose_right, "right", self.latest_end_pose_right.header.frame_id
+            )
 
         if not self.dry_run:
             self._publish_pose_to_servo(target_pose_left, "left")

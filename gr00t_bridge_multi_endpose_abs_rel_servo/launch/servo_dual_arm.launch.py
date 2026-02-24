@@ -9,7 +9,16 @@
 #
 # Prerequisites:
 #   1. Robot bringup must be running (robot_state_publisher, controllers)
-#   2. ros-jazzy-moveit-servo must be installed
+#   2. /joint_states must be published (bringup or bag play with joint_states topic)
+#   3. ros-jazzy-moveit-servo must be installed
+#
+# If Servo stays at "Waiting to receive robot state update.":
+#   - MoveIt2 ignores joint_states when all positions are unchanged (e.g. all 0).
+#   - Run once: python3 scripts/joint_state_jiggle.py  (then Ctrl+C after "Jiggle published")
+#   - Or ensure /joint_states is publishing and has changed at least once.
+#
+# For bag replay with --clock, use sim time (argument name is use_sim, not use_sim_time):
+#   ros2 launch ... servo_dual_arm.launch.py use_sim:=true
 
 import os
 import yaml
