@@ -6,9 +6,10 @@
 
       arm_l_controller:
         type: joint_trajectory_controller/JointTrajectoryController
-
+        # type: position_controllers/JointGroupPositionController  # ⭐️ JTC 대신 이것으로 변경
       arm_r_controller:
         type: joint_trajectory_controller/JointTrajectoryController
+        # type: position_controllers/JointGroupPositionController  # ⭐️ JTC 대신 이것으로 변경
 
       head_controller:
         type: joint_trajectory_controller/JointTrajectoryController

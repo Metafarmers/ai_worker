@@ -20,8 +20,8 @@ moveit_servo:
   incoming_command_timeout: 1.0   # 0.3 can drop commands between inference cycles
 
   scale:
-    linear: 0.2                   # m/s — 동작 확인용 (특이점에서도 소폭 움직임 나오도록)
-    rotational: 0.4                # rad/s
+    linear: 0.4               # m/s — 동작 확인용 (특이점에서도 소폭 움직임 나오도록)
+    rotational: 0.8                # rad/s
     joint: 0.5
 
   ## Twist settings
@@ -29,15 +29,15 @@ moveit_servo:
 
   ## Pose tracking
   pose_tracking:
-    linear_tolerance: 0.001       # 1 mm
-    angular_tolerance: 0.01       # ~0.57 deg
+    linear_tolerance: 0.0001    # 1mm -> 0.1mm 로 축소
+    angular_tolerance: 0.001    # ~0.057 deg 로 축소
 
   ## Outgoing command settings
   status_topic: "~/status"
   command_out_topic: "/leader/joint_trajectory_command_broadcaster_left/joint_trajectory"
   command_out_type: "trajectory_msgs/JointTrajectory"
   publish_joint_positions: true
-  publish_joint_velocities: true
+  publish_joint_velocities: false
   publish_joint_accelerations: false
 
   ## Planning scene monitor
@@ -47,7 +47,7 @@ moveit_servo:
   is_primary_planning_scene_monitor: true
 
   ## Smoothing
-  use_smoothing: true
+  use_smoothing: false
   smoothing_filter_plugin_name: "online_signal_smoothing::ButterworthFilterPlugin"
 
   ## Collision
@@ -56,11 +56,11 @@ moveit_servo:
   scene_collision_proximity_threshold: 0.02
   collision_check_rate: 10.0
 
-  ## Singularity — threshold 낮추면 특이점 근처에서도 속도가 덜 잘리어 움직임 가능 (안전 주의)
-  lower_singularity_threshold: 0.001
-  hard_stop_singularity_threshold: 30.0
-  leaving_singularity_threshold_multiplier: 2.0
-  singularity_step_scale: 0.01
+  ## Singularity
+  lower_singularity_threshold: 17.0        # 감속 시작 기준 (매우 큰 값)
+  hard_stop_singularity_threshold: 30.0    # 완전 정지 기준 (lower 보다 커야 함!)
+  leaving_singularity_threshold_multiplier: 1.0
+  singularity_step_scale: 1.0                # 감속 없이 100% 속도 유지
 
   ## Joint limiting
   halt_all_joints_in_joint_mode: true
@@ -68,3 +68,4 @@ moveit_servo:
   joint_limit_margins: [0.1]
   override_velocity_scaling_factor: 1.0
   wait_for_initial_state_timeout: 10.0
+

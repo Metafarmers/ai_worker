@@ -484,6 +484,8 @@ class Gr00tEndPoseRelServoNode(Node):
         self.declare_parameter("action_horizon_step_delay", 0.02)
         self.declare_parameter("gripper_step_duration_sec", 0.05)
         self.declare_parameter("step_by_step", False)
+        # Left arm delta position axis flip when left arm was going backward (e.g. [1, -1, 1] for y mirror). Use [1,1,1] for no correction.
+        self.declare_parameter("left_arm_position_flip", [1.0, -1.0, 1.0])
 
     # =========================================================================
     # Initialization
@@ -534,18 +536,37 @@ class Gr00tEndPoseRelServoNode(Node):
         self.get_logger().info(f"  Left:  /{self.servo_left_ns}/pose_target_cmds")
         self.get_logger().info(f"  Right: /{self.servo_right_ns}/pose_target_cmds")
 
-        # Subscribe to Servo status for monitoring
+        # # Subscribe to Servo status for monitoring
+        # self.servo_status_left_sub = self.create_subscription(
+        #     ServoStatus,
+        #     f"/{self.servo_left_ns}/status",
+        #     lambda msg: self._servo_status_callback(msg, "left"),
+        #     10,
+        # )
+        # self.servo_status_right_sub = self.create_subscription(
+        #     ServoStatus,
+        #     f"/{self.servo_right_ns}/status",
+        #     lambda msg: self._servo_status_callback(msg, "right"),
+        #     10,
+        # )
+        servo_status_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
         self.servo_status_left_sub = self.create_subscription(
             ServoStatus,
             f"/{self.servo_left_ns}/status",
             lambda msg: self._servo_status_callback(msg, "left"),
-            10,
+            servo_status_qos,  # 여기 변경
         )
         self.servo_status_right_sub = self.create_subscription(
             ServoStatus,
             f"/{self.servo_right_ns}/status",
             lambda msg: self._servo_status_callback(msg, "right"),
-            10,
+            servo_status_qos,  # 여기 변경
         )
 
     def _init_servo_service_clients(self):
@@ -932,6 +953,17 @@ class Gr00tEndPoseRelServoNode(Node):
         gripper_l = self.action_buffer.gripper_l[idx].flatten()
         delta_right = self.action_buffer.rel_end_pose_right[idx].flatten()
         gripper_r = self.action_buffer.gripper_r[idx].flatten()
+
+        # Apply left-arm position flip when left arm was going backward (e.g. y mirror [1, -1, 1]).
+        flip = np.array(
+            self.get_parameter("left_arm_position_flip").value,
+            dtype=np.float32,
+        )
+        if flip.shape == (3,) and np.any(flip != 1.0):
+            delta_left = np.concatenate([
+                delta_left[:3] * flip,
+                delta_left[3:7],
+            ])
 
         target_pose_left = apply_relative_action(self.tracking_pose_left, delta_left)
         target_pose_right = apply_relative_action(self.tracking_pose_right, delta_right)
