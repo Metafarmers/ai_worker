@@ -16,6 +16,11 @@ install(DIRECTORY launch DESTINATION share/${PROJECT_NAME}
   PATTERN "setup_assistant.launch" EXCLUDE)
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
+install(PROGRAMS
+  scripts/moveit_control_example
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ################################################################################
 # Macro for ament package
 ################################################################################
