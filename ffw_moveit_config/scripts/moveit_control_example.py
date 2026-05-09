@@ -227,7 +227,7 @@ class MoveItControlExample(Node):
     )
     log(
       '  3) Without simulation, omit use_sim_time: '
-      'ros2 run ffw_moveit_config moveit_control_example --mode joint'
+      'ros2 run ffw_moveit_config moveit_control_example.py --mode joint'
     )
     log(
       '  4) Same ROS_DOMAIN_ID in every terminal; use same ROS_LOCALHOST_ONLY if set.'

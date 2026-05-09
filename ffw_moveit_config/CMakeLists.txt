@@ -17,7 +17,11 @@ install(DIRECTORY launch DESTINATION share/${PROJECT_NAME}
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
 install(PROGRAMS
-  scripts/moveit_control_example
+  scripts/moveit_control_example.py
+  scripts/moveit_planning_scene_obstacles.py
+  scripts/moveit_plan_avoid_obstacles.py
+  scripts/obstacle_node.py
+  scripts/pathplanning_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
