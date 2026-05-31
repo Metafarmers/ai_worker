@@ -147,4 +147,5 @@ RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> ~/.bashrc  && \
     echo "alias ffw_sg2_follower_ai='ros2 launch ffw_bringup ffw_sg2_follower_ai.launch.py'" >> ~/.bashrc && \
     echo "alias ffw_bg2_ai='ros2 launch ffw_bringup ffw_bg2_ai.launch.py'" >> ~/.bashrc && \
     echo "alias ffw_sg2_ai='ros2 launch ffw_bringup ffw_sg2_ai.launch.py'" >> ~/.bashrc && \
-    echo "export ROS_DOMAIN_ID=30" >> ~/.bashrc
+    echo "export ROS_DOMAIN_ID=30" >> ~/.bashrc && \
+    echo "export CUROBO_URL=http://127.0.0.1:8000/plan" >> ~/.bashrc

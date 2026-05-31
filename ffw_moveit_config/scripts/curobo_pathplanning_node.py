@@ -4,6 +4,10 @@
 #
 # obstacle_node (/obstacle_markers) -> MoveIt planning scene + cuRobo HTTP /plan -> ExecuteTrajectory
 #
+# Service/action futures from subscription callbacks must not call spin_until_future_complete
+# while MultiThreadedExecutor is spinning (Jazzy: action client wait-set corruption / crash).
+# Poll futures with short sleeps instead; see pathplanning_node.py.
+#
 # Prerequisites (typical sim stack):
 #   1. ros2 launch ffw_bringup ffw_sg2_follower_ai_gazebo.launch.py
 #   2. ros2 launch ffw_moveit_config moveit.launch.py use_sim:=true
@@ -17,7 +21,9 @@
 # name (e.g. http://curobo:8000/plan), or host.docker.internal with --add-host=host-gateway.
 #
 # RViz: obstacles appear via planning scene; target pose on /curobo_target_markers (MarkerArray)
-#   and /curobo_target_pose (PoseStamped). Fixed Frame = planning_frame (default base_link).
+#   and /curobo_target_pose (PoseStamped). Planned path on display_planned_path_topic.
+#   With confirm_before_execute:=true, check RViz then Enter in the launch terminal, or:
+#     ros2 topic pub --once /curobo/confirm_execute std_msgs/msg/Empty {}
 # Manual goal: publish geometry_msgs/PoseStamped on goal_pose_topic (default /target_pose).
 
 from __future__ import annotations
@@ -38,15 +44,15 @@ from typing import Dict, List, Optional
 
 import rclpy
 from rclpy.action import ActionClient
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import Pose, PoseStamped
-from std_msgs.msg import ColorRGBA, Header
+from std_msgs.msg import ColorRGBA, Empty, Header
 from moveit_msgs.action import ExecuteTrajectory
-from moveit_msgs.msg import MoveItErrorCodes, RobotTrajectory
+from moveit_msgs.msg import DisplayTrajectory, MoveItErrorCodes, RobotState, RobotTrajectory
 from moveit_msgs.srv import ApplyPlanningScene
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectoryPoint
@@ -122,11 +128,14 @@ TARGET_MARKER_ID_SPHERE = 1
 class CuRoboPathPlanningNode(Node):
   def __init__(self) -> None:
     super().__init__('curobo_pathplanning_node')
+    # Planning/obstacles block inside this group; confirm must use a separate group so
+    # MultiThreadedExecutor can run _on_execute_confirm while waiting on event.wait().
     self._cb_group = ReentrantCallbackGroup()
+    self._confirm_cb_group = MutuallyExclusiveCallbackGroup()
 
     self.declare_parameter('obstacle_topic', '/obstacle_markers')
     self.declare_parameter('apply_planning_scene_service', '')
-    self.declare_parameter('move_group_namespace', '/move_group')
+    self.declare_parameter('move_group_namespace', 'root')
     _default_curobo_url = os.environ.get('CUROBO_URL', 'http://127.0.0.1:8000/plan')
     self.declare_parameter('curobo_url', _default_curobo_url)
     self.declare_parameter('curobo_health_url', '')
@@ -158,6 +167,13 @@ class CuRoboPathPlanningNode(Node):
     self.declare_parameter('target_marker_publish_period_sec', 1.0)
     self.declare_parameter('target_arrow_length', 0.12)
     self.declare_parameter('target_sphere_diameter', 0.06)
+    self.declare_parameter('velocity_scale', 0.2)
+    self.declare_parameter('confirm_before_execute', True)
+    self.declare_parameter('execute_confirm_topic', '/curobo/confirm_execute')
+    self.declare_parameter('display_planned_path_topic', '/display_planned_path')
+    self.declare_parameter('robot_model_id', 'ffw')
+    self.declare_parameter('display_path_publish_count', 3)
+    self.declare_parameter('wait_for_joint_states_sec', 30.0)
 
     self._curobo_url = str(self.get_parameter('curobo_url').value).strip()
     health_param = str(self.get_parameter('curobo_health_url').value).strip()
@@ -178,6 +194,8 @@ class CuRoboPathPlanningNode(Node):
     self._last_plan_mono = -1e10
     self._last_marker_sig: tuple | None = None
     self._obstacle_lock = threading.Lock()
+    self._plan_lock = threading.Lock()
+    self._execute_confirm_event = threading.Event()
 
     srv = self._resolve_apply_scene_service()
     self._apply_scene_cli = self.create_client(
@@ -204,16 +222,44 @@ class CuRoboPathPlanningNode(Node):
       durability=DurabilityPolicy.VOLATILE,
       reliability=ReliabilityPolicy.RELIABLE,
     )
+    self._js_qos = QoSProfile(
+      depth=10,
+      durability=DurabilityPolicy.TRANSIENT_LOCAL,
+      reliability=ReliabilityPolicy.RELIABLE,
+    )
 
     js_topic = str(self.get_parameter('joint_state_topic').value)
     self.create_subscription(
       JointState,
       js_topic,
       self._on_joint_states,
-      10,
+      self._js_qos,
       callback_group=self._cb_group,
     )
-    self.get_logger().info(f'Subscribed to {js_topic}')
+    self.get_logger().info(f'Subscribed to {js_topic} (RELIABLE, TRANSIENT_LOCAL)')
+
+    display_topic = str(self.get_parameter('display_planned_path_topic').value).strip()
+    self._display_path_pub = self.create_publisher(
+      DisplayTrajectory, display_topic, self._qos
+    )
+    self.get_logger().info(f'Planned path RViz topic: {display_topic}')
+
+    confirm_topic = str(self.get_parameter('execute_confirm_topic').value).strip()
+    if confirm_topic:
+      self.create_subscription(
+        Empty,
+        confirm_topic,
+        self._on_execute_confirm,
+        self._qos,
+        callback_group=self._confirm_cb_group,
+      )
+      self.get_logger().info(f'Execute confirm topic: {confirm_topic}')
+
+    vscale = float(self.get_parameter('velocity_scale').value)
+    confirm = bool(self.get_parameter('confirm_before_execute').value)
+    self.get_logger().info(
+      f'velocity_scale={vscale:.2f}, confirm_before_execute={confirm}'
+    )
 
     goal_topic = str(self.get_parameter('goal_pose_topic').value).strip()
     if goal_topic:
@@ -390,11 +436,13 @@ class CuRoboPathPlanningNode(Node):
     return False
 
   def _wait_future_done(self, fut, timeout_sec: float = 120.0) -> bool:
+    """Block without calling executor.spin* (safe under MultiThreadedExecutor)."""
     deadline = time.monotonic() + timeout_sec
     while rclpy.ok():
       if fut.done():
         return True
       if time.monotonic() >= deadline:
+        self.get_logger().error('Timed out waiting for async future (service/action)')
         return False
       time.sleep(0.002)
     return False
@@ -406,7 +454,22 @@ class CuRoboPathPlanningNode(Node):
       return False
     if not self._wait_action_server(self._execute, 'ExecuteTrajectory'):
       return False
+    js_timeout = float(self.get_parameter('wait_for_joint_states_sec').value)
+    if not self._wait_for_joint_states(js_timeout):
+      self.get_logger().error(
+        'No joint_states received (check follower bringup and joint_state QoS).'
+      )
+      return False
     return True
+
+  def _wait_for_joint_states(self, timeout_sec: float) -> bool:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+      if self._latest_joint_state is not None:
+        self.get_logger().info('Received /joint_states.')
+        return True
+      rclpy.spin_once(self, timeout_sec=0.05)
+    return self._latest_joint_state is not None
 
   def create_obstacle_subscription(self) -> None:
     topic = str(self.get_parameter('obstacle_topic').value)
@@ -527,6 +590,24 @@ class CuRoboPathPlanningNode(Node):
       self._plan_and_execute(reason='obstacle_update')
 
   def _plan_and_execute(self, reason: str) -> None:
+    if not self._plan_lock.acquire(blocking=False):
+      self.get_logger().warn('Planning already in progress; skipping.')
+      return
+    # Run plan + confirm wait off the executor so /curobo/confirm_execute callbacks
+    # can be dispatched while we block on threading.Event (not inside a ROS callback).
+    threading.Thread(
+      target=self._plan_and_execute_worker,
+      args=(reason,),
+      daemon=True,
+    ).start()
+
+  def _plan_and_execute_worker(self, reason: str) -> None:
+    try:
+      self._plan_and_execute_locked(reason)
+    finally:
+      self._plan_lock.release()
+
+  def _plan_and_execute_locked(self, reason: str) -> None:
     try:
       state_names, state_positions = self._current_curobo_joint_state()
     except RuntimeError as e:
@@ -584,9 +665,28 @@ class CuRoboPathPlanningNode(Node):
         self.get_logger().error(f'cuRobo planning failed: {msg}')
       return
 
-    if self._send_execute_trajectory(plan):
+    traj = self._plan_dict_to_trajectory(plan)
+    if traj is None:
+      return
+
+    vscale = float(self.get_parameter('velocity_scale').value)
+    self._scale_trajectory_speed(traj, vscale)
+    self._publish_display_trajectory(traj)
+
+    if not self._wait_for_execute_confirmation():
+      self.get_logger().info('Execution skipped.')
+      return
+
+    self.get_logger().info('Sending ExecuteTrajectory to MoveIt...')
+    if self._execute_trajectory(traj):
       self._last_plan_mono = time.monotonic()
       self.get_logger().info('cuRobo trajectory executed.')
+    else:
+      self.get_logger().error(
+        'ExecuteTrajectory failed (check move_group, arm_l/lift controllers, '
+        'and move_group_namespace; for ffw moveit.launch.py use '
+        'move_group_namespace:=root)'
+      )
 
   def _current_trajectory_positions(self, joint_names: List[str]) -> Optional[List[float]]:
     if self._latest_joint_state is None:
@@ -622,11 +722,11 @@ class CuRoboPathPlanningNode(Node):
         return
     traj.joint_trajectory.points.insert(0, pt0)
 
-  def _send_execute_trajectory(self, plan: dict) -> bool:
+  def _plan_dict_to_trajectory(self, plan: dict) -> Optional[RobotTrajectory]:
     points = plan.get('points') or []
     if not points:
       self.get_logger().error('Empty trajectory from cuRobo')
-      return False
+      return None
 
     traj = RobotTrajectory()
     joint_names = list(plan.get('joint_names', self._trajectory_joints))
@@ -639,7 +739,7 @@ class CuRoboPathPlanningNode(Node):
         self.get_logger().error(
           f'Trajectory point has {len(pt.positions)} joints, expected {len(joint_names)}'
         )
-        return False
+        return None
       if p.get('velocities') is not None:
         pt.velocities = [float(x) for x in p['velocities']]
       if p.get('accelerations') is not None:
@@ -651,6 +751,89 @@ class CuRoboPathPlanningNode(Node):
 
     self._prepend_trajectory_start_state(traj)
     traj.joint_trajectory.header.stamp = self.get_clock().now().to_msg()
+    return traj
+
+  def _scale_trajectory_speed(self, traj: RobotTrajectory, speed_scale: float) -> None:
+    """Stretch trajectory time and scale vel/acc; speed_scale in (0, 1]."""
+    speed_scale = max(min(float(speed_scale), 1.0), 0.01)
+    if speed_scale >= 0.999:
+      return
+    duration_factor = 1.0 / speed_scale
+    jt = traj.joint_trajectory
+    for pt in jt.points:
+      t = float(pt.time_from_start.sec) + float(pt.time_from_start.nanosec) * 1e-9
+      t *= duration_factor
+      pt.time_from_start.sec = int(t)
+      pt.time_from_start.nanosec = int(round((t - int(t)) * 1e9))
+      if pt.velocities:
+        pt.velocities = [float(v) * speed_scale for v in pt.velocities]
+      if pt.accelerations:
+        s2 = speed_scale * speed_scale
+        pt.accelerations = [float(a) * s2 for a in pt.accelerations]
+    if jt.points:
+      last_t = float(jt.points[-1].time_from_start.sec) + (
+        float(jt.points[-1].time_from_start.nanosec) * 1e-9
+      )
+      self.get_logger().info(
+        f'Trajectory slowed: velocity_scale={speed_scale:.2f}, '
+        f'duration≈{last_t:.2f}s ({len(jt.points)} points)'
+      )
+
+  def _publish_display_trajectory(self, traj: RobotTrajectory) -> None:
+    display = DisplayTrajectory()
+    display.model_id = str(self.get_parameter('robot_model_id').value)
+    if self._latest_joint_state is not None:
+      start = RobotState()
+      start.joint_state = self._latest_joint_state
+      display.trajectory_start = start
+    display.trajectory.append(traj)
+    count = max(1, int(self.get_parameter('display_path_publish_count').value))
+    for _ in range(count):
+      self._display_path_pub.publish(display)
+      time.sleep(0.05)
+    self.get_logger().info(
+      'Planned path published for RViz (MotionPlanning → Planned Path, '
+      f'topic {self._display_path_pub.topic_name}).'
+    )
+
+  def _on_execute_confirm(self, _msg: Empty) -> None:
+    self.get_logger().info('Execute confirmed via topic.')
+    self._execute_confirm_event.set()
+
+  def _wait_for_execute_confirmation(self) -> bool:
+    if not bool(self.get_parameter('confirm_before_execute').value):
+      return True
+    confirm_topic = str(self.get_parameter('execute_confirm_topic').value).strip()
+    self.get_logger().info(
+      '>>> Check planned path in RViz. Then confirm execution using either:\n'
+      '    • Press Enter in the terminal that launched this node (needs TTY), or\n'
+      f'    • ros2 topic pub --once {confirm_topic} std_msgs/msg/Empty "{{}}"'
+    )
+    self._execute_confirm_event.clear()
+
+    def _stdin_confirm() -> None:
+      if not sys.stdin.isatty():
+        self.get_logger().warn(
+          'stdin is not a TTY — Enter in this terminal will NOT confirm execution. '
+          f'Use: ros2 topic pub --once {confirm_topic} std_msgs/msg/Empty "{{}}"'
+        )
+        return
+      try:
+        input()
+        self.get_logger().info('Execute confirmed (Enter).')
+        self._execute_confirm_event.set()
+      except EOFError:
+        pass
+
+    threading.Thread(target=_stdin_confirm, daemon=True).start()
+
+    while rclpy.ok():
+      if self._execute_confirm_event.wait(timeout=0.2):
+        return True
+
+  def _execute_trajectory(self, traj: RobotTrajectory) -> bool:
+    traj.joint_trajectory.header.stamp = self.get_clock().now().to_msg()
+    joint_names = list(traj.joint_trajectory.joint_names)
 
     goal = ExecuteTrajectory.Goal()
     goal.trajectory = traj
@@ -673,11 +856,11 @@ class CuRoboPathPlanningNode(Node):
       self.get_logger().error(f'ExecuteTrajectory failed: {v} ({hint})')
       if v == -4 and traj.joint_trajectory.points:
         cur = self._current_trajectory_positions(joint_names)
-        goal = list(traj.joint_trajectory.points[-1].positions)
+        goal_pos = list(traj.joint_trajectory.points[-1].positions)
         if cur is not None:
-          deltas = [abs(float(c) - float(g)) for c, g in zip(cur, goal)]
+          deltas = [abs(float(c) - float(g)) for c, g in zip(cur, goal_pos)]
           self.get_logger().error(
-            f'  joints={joint_names}; max|current-goal|={max(deltas):.3f} rad/m'
+            f'  joints={joint_names}; max|current-goal|={max(deltas):.3f} rad'
           )
       return False
     return True
