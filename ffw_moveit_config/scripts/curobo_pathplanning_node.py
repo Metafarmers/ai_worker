@@ -156,6 +156,8 @@ class CuRoboPathPlanningNode(Node):
     self.declare_parameter('robot_base_x', 0.0)
     self.declare_parameter('robot_base_y', 0.0)
     self.declare_parameter('home', False)
+    # false: wait for first /target_pose before planning; true: legacy random goal at startup
+    self.declare_parameter('seed_goal_on_start', False)
     self.declare_parameter('sync_moveit_scene', True)
     self.declare_parameter('send_obstacles_to_curobo', True)
     self.declare_parameter('curobo_obstacle_dim_scale', 0.92)
@@ -174,6 +176,8 @@ class CuRoboPathPlanningNode(Node):
     self.declare_parameter('robot_model_id', 'ffw')
     self.declare_parameter('display_path_publish_count', 3)
     self.declare_parameter('wait_for_joint_states_sec', 30.0)
+    self.declare_parameter('joint_state_stale_sec', 0.5)
+    self.declare_parameter('joint_state_stamp_tolerance_sec', 2.0)
 
     self._curobo_url = str(self.get_parameter('curobo_url').value).strip()
     health_param = str(self.get_parameter('curobo_health_url').value).strip()
@@ -190,12 +194,17 @@ class CuRoboPathPlanningNode(Node):
     self._trajectory_joints = list(TRAJECTORY_JOINTS)
     self._curobo_state_joints = list(CUROBO_STATE_JOINTS)
     self._latest_joint_state: Optional[JointState] = None
+    self._latest_joint_state_mono: float = -1e10
+    self._last_joint_state_stamp_warn_mono: float = -1e10
     self._last_obstacle_cuboids: List[dict] = []
     self._last_plan_mono = -1e10
     self._last_marker_sig: tuple | None = None
     self._obstacle_lock = threading.Lock()
     self._plan_lock = threading.Lock()
     self._execute_confirm_event = threading.Event()
+    self._goal_ready = False
+    self._cached_goal_xyz: Optional[tuple[float, float, float]] = None
+    self._cached_goal_quat = None
 
     srv = self._resolve_apply_scene_service()
     self._apply_scene_cli = self.create_client(
@@ -224,7 +233,7 @@ class CuRoboPathPlanningNode(Node):
     )
     self._js_qos = QoSProfile(
       depth=10,
-      durability=DurabilityPolicy.TRANSIENT_LOCAL,
+      durability=DurabilityPolicy.VOLATILE,
       reliability=ReliabilityPolicy.RELIABLE,
     )
 
@@ -236,7 +245,7 @@ class CuRoboPathPlanningNode(Node):
       self._js_qos,
       callback_group=self._cb_group,
     )
-    self.get_logger().info(f'Subscribed to {js_topic} (RELIABLE, TRANSIENT_LOCAL)')
+    self.get_logger().info(f'Subscribed to {js_topic} (RELIABLE, VOLATILE)')
 
     display_topic = str(self.get_parameter('display_planned_path_topic').value).strip()
     self._display_path_pub = self.create_publisher(
@@ -292,6 +301,19 @@ class CuRoboPathPlanningNode(Node):
     return quat_toward_robot_y_up(xyz, robot_base_xy=(bx, by))
 
   def _init_goal_cache(self) -> None:
+    seed = self.get_parameter('seed_goal_on_start').value
+    seed_on = seed if isinstance(seed, bool) else str(seed).strip().lower() in ('true', '1', 'yes')
+    if not seed_on:
+      self._goal_ready = False
+      self._cached_goal_xyz = None
+      self._cached_goal_quat = None
+      goal_topic = str(self.get_parameter('goal_pose_topic').value).strip()
+      self.get_logger().info(
+        f'seed_goal_on_start=false: no initial goal; waiting for first message on {goal_topic}'
+      )
+      return
+
+    self._goal_ready = True
     home = self.get_parameter('home').value
     home_on = home if isinstance(home, bool) else str(home).strip().lower() in ('true', '1', 'yes')
     if home_on:
@@ -341,6 +363,8 @@ class CuRoboPathPlanningNode(Node):
     )
 
   def _cached_goal_pose_msg(self) -> Pose:
+    if self._cached_goal_xyz is None or self._cached_goal_quat is None:
+      raise RuntimeError('No goal cached')
     x, y, z = self._cached_goal_xyz
     q = self._cached_goal_quat
     pose = Pose()
@@ -390,6 +414,8 @@ class CuRoboPathPlanningNode(Node):
 
   def _publish_target_visualization(self) -> None:
     if not bool(self.get_parameter('publish_target_visualization').value):
+      return
+    if not self._goal_ready:
       return
     if not hasattr(self, '_target_marker_pub'):
       return
@@ -484,6 +510,32 @@ class CuRoboPathPlanningNode(Node):
 
   def _on_joint_states(self, msg: JointState) -> None:
     self._latest_joint_state = msg
+    self._latest_joint_state_mono = time.monotonic()
+    # Detect ROS-time mismatch (e.g., use_sim_time mismatch or stale timestamps).
+    stamp = msg.header.stamp
+    stamp_sec = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+    if stamp_sec > 0.0:
+      now_msg = self.get_clock().now().to_msg()
+      now_sec = float(now_msg.sec) + float(now_msg.nanosec) * 1e-9
+      diff = abs(now_sec - stamp_sec)
+      tol = max(float(self.get_parameter('joint_state_stamp_tolerance_sec').value), 0.1)
+      if diff > tol:
+        mono = time.monotonic()
+        if mono - self._last_joint_state_stamp_warn_mono > 5.0:
+          self._last_joint_state_stamp_warn_mono = mono
+          self.get_logger().warn(
+            f'/joint_states stamp drift: |now-stamp|={diff:.3f}s '
+            f'(tolerance={tol:.3f}s). Check use_sim_time and /clock sync.'
+          )
+
+  def _joint_state_is_fresh(self) -> bool:
+    if self._latest_joint_state is None:
+      return False
+    stale_sec = max(float(self.get_parameter('joint_state_stale_sec').value), 0.0)
+    if stale_sec <= 0.0:
+      return True
+    age = time.monotonic() - self._latest_joint_state_mono
+    return age <= stale_sec
 
   def _current_curobo_joint_state(self) -> tuple[List[str], List[float]]:
     """Full-body start state for cuRobo FK; trajectory still uses arm_l only."""
@@ -540,9 +592,11 @@ class CuRoboPathPlanningNode(Node):
     xyz, _ = self._goal_from_pose_stamped(msg)
     self._cached_goal_xyz = xyz
     self._cached_goal_quat = self._goal_quat_for_position(xyz)
-    self.get_logger().info(f'Manual goal updated: xyz={xyz} (orientation: +X→robot, +Y↑)')
+    first_goal = not self._goal_ready
+    self._goal_ready = True
+    self.get_logger().info(f'Goal updated: xyz={xyz} (orientation: +X→robot, +Y↑)')
     self._publish_target_visualization()
-    self._plan_and_execute(reason='goal_pose_topic')
+    self._plan_and_execute(reason='goal_pose_topic' if not first_goal else 'first_goal_pose')
 
   def _call_apply_planning_scene(self, scene) -> bool:
     req = ApplyPlanningScene.Request()
@@ -590,6 +644,12 @@ class CuRoboPathPlanningNode(Node):
       self._plan_and_execute(reason='obstacle_update')
 
   def _plan_and_execute(self, reason: str) -> None:
+    if not self._goal_ready:
+      self.get_logger().info(
+        f'Skip plan ({reason}): no goal yet — publish /target_pose first',
+        throttle_duration_sec=5.0,
+      )
+      return
     if not self._plan_lock.acquire(blocking=False):
       self.get_logger().warn('Planning already in progress; skipping.')
       return
@@ -608,6 +668,15 @@ class CuRoboPathPlanningNode(Node):
       self._plan_lock.release()
 
   def _plan_and_execute_locked(self, reason: str) -> None:
+    if not self._goal_ready or self._cached_goal_xyz is None or self._cached_goal_quat is None:
+      self.get_logger().warn(f'Skip plan ({reason}): goal not ready')
+      return
+    if not self._joint_state_is_fresh():
+      age = time.monotonic() - self._latest_joint_state_mono
+      self.get_logger().warn(
+        f'Skip plan ({reason}): /joint_states stale ({age:.2f}s old).'
+      )
+      return
     try:
       state_names, state_positions = self._current_curobo_joint_state()
     except RuntimeError as e:
@@ -832,6 +901,8 @@ class CuRoboPathPlanningNode(Node):
         return True
 
   def _execute_trajectory(self, traj: RobotTrajectory) -> bool:
+    # Re-sync start right before sending to avoid controller start mismatch.
+    self._prepend_trajectory_start_state(traj)
     traj.joint_trajectory.header.stamp = self.get_clock().now().to_msg()
     joint_names = list(traj.joint_trajectory.joint_names)
 

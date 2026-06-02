@@ -30,8 +30,20 @@ install(PROGRAMS
   scripts/pathplanning_node.py
   scripts/curobo_obstacle_utils.py
   scripts/curobo_pathplanning_node.py
+  scripts/perception_visualize_node.py
+  scripts/perception_tf_node.py
+  scripts/perception_click_planning_node.py
+  scripts/run_perception_tf.sh
+  scripts/run_perception_click_planning.sh
   DESTINATION lib/${PROJECT_NAME}
 )
+
+install(FILES
+  scripts/perception_3d_utils.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(DIRECTORY config/model DESTINATION share/${PROJECT_NAME}/config)
 
 ################################################################################
 # Macro for ament package

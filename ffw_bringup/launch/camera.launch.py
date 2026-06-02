@@ -29,7 +29,15 @@ def generate_launch_description():
 
     camera_zed = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(bringup_launch_dir, 'camera_zed.launch.py')),
-        launch_arguments={'camera_model': 'zedm'}.items()
+        launch_arguments={
+            'camera_model': 'zedm',
+            'camera_name': 'zedm',       # frame_id: zedm_* (matches ffw_description URDF)
+            'namespace': 'zed',          # topics stay /zed/zed_node/...
+            'node_name': 'zed_node',
+            'publish_urdf': 'false',     # do not spawn zed_camera_link; robot URDF has zedm_camera_link
+            'publish_tf': 'false',
+            'publish_map_tf': 'false',
+        }.items()
     )
     camera_realsense = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(bringup_launch_dir,
