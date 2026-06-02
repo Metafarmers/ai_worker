@@ -160,7 +160,7 @@ class CuRoboPathPlanningNode(Node):
     self.declare_parameter('seed_goal_on_start', False)
     self.declare_parameter('sync_moveit_scene', True)
     self.declare_parameter('send_obstacles_to_curobo', True)
-    self.declare_parameter('curobo_obstacle_dim_scale', 0.92)
+    self.declare_parameter('curobo_obstacle_dim_scale', 1.0)
     self.declare_parameter('use_passive_defaults_for_start', True)
     self.declare_parameter('skip_start_feasibility_check', False)
     self.declare_parameter('publish_target_visualization', True)

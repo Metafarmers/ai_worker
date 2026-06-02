@@ -53,6 +53,7 @@ OBSTACLE_MARKER_NS = 'obstacle_cuboid'
 TARGET_MARKER_NS = 'click_target'
 TARGET_MARKER_ID_SPHERE = 1
 TARGET_MARKER_ID_ARROW = 2
+TARGET_BACK_WALL_ID = 1000000
 
 
 def _quat_from_yaw(yaw: float):
@@ -63,16 +64,6 @@ def _quat_from_yaw(yaw: float):
   q.y = 0.0
   q.z = math.sin(half)
   q.w = math.cos(half)
-  return q
-
-
-def _identity_quat():
-  from geometry_msgs.msg import Quaternion
-  q = Quaternion()
-  q.x = 0.0
-  q.y = 0.0
-  q.z = 0.0
-  q.w = 1.0
   return q
 
 
@@ -127,6 +118,11 @@ class PerceptionClickPlanningNode(Node):
     self.declare_parameter('obstacle_yaw', 0.0)
     self.declare_parameter('target_arrow_length', 0.12)
     self.declare_parameter('target_sphere_diameter', 0.06)
+    self.declare_parameter('enable_target_back_wall', True)
+    self.declare_parameter('target_back_wall_offset_m', 0.07)
+    self.declare_parameter('target_back_wall_size_x', 0.03)
+    self.declare_parameter('target_back_wall_size_y', 0.50)
+    self.declare_parameter('target_back_wall_size_z', 0.50)
     self.declare_parameter('tf_parent_frame', '')
 
     self._planning_frame = str(self.get_parameter('planning_frame').value)
@@ -152,6 +148,13 @@ class PerceptionClickPlanningNode(Node):
     )
     self._obstacle_yaw = float(self.get_parameter('obstacle_yaw').value)
     self._publish_target_markers = bool(self.get_parameter('publish_target_markers').value)
+    self._enable_target_back_wall = bool(self.get_parameter('enable_target_back_wall').value)
+    self._target_back_wall_offset_m = float(self.get_parameter('target_back_wall_offset_m').value)
+    self._target_back_wall_size = (
+      max(float(self.get_parameter('target_back_wall_size_x').value), 0.01),
+      max(float(self.get_parameter('target_back_wall_size_y').value), 0.01),
+      max(float(self.get_parameter('target_back_wall_size_z').value), 0.01),
+    )
 
     self._bridge = CvBridge()
     self._data_lock = threading.Lock()
@@ -336,9 +339,7 @@ class PerceptionClickPlanningNode(Node):
     )
 
   def _make_target_pose_msg(self, pt: PlanningClickPoint, stamp) -> PoseStamped:
-    # Position-only goal: orientation is ignored by the cuRobo server.
-    # We still publish a valid quaternion to satisfy message type requirements.
-    q = _identity_quat()
+    q = self._goal_quat_for_position((pt.x, pt.y, pt.z))
     msg = PoseStamped()
     msg.header.stamp = stamp
     msg.header.frame_id = self._planning_frame
@@ -353,12 +354,6 @@ class PerceptionClickPlanningNode(Node):
 
   def _make_target_markers(self, pt: PlanningClickPoint, stamp) -> MarkerArray:
     pose_msg = self._make_target_pose_msg(pt, stamp)
-    # Marker arrow keeps pointing toward the target for human readability.
-    q = self._goal_quat_for_position((pt.x, pt.y, pt.z))
-    pose_msg.pose.orientation.x = float(q.x)
-    pose_msg.pose.orientation.y = float(q.y)
-    pose_msg.pose.orientation.z = float(q.z)
-    pose_msg.pose.orientation.w = float(q.w)
     arrow_len = float(self.get_parameter('target_arrow_length').value)
     sphere_d = float(self.get_parameter('target_sphere_diameter').value)
 
@@ -394,6 +389,7 @@ class PerceptionClickPlanningNode(Node):
   def _build_obstacle_markers(self, stamp) -> MarkerArray:
     with self._state_lock:
       obstacles = list(self._obstacles)
+      target = self._target
 
     arr = MarkerArray()
     delete_all = Marker()
@@ -418,6 +414,32 @@ class PerceptionClickPlanningNode(Node):
       m.scale.z = sz
       m.color = ColorRGBA(r=1.0, g=0.4, b=0.1, a=0.85)
       arr.markers.append(m)
+
+    # Optional virtual wall: place a thin cuboid 1cm behind the target.
+    if self._enable_target_back_wall and target is not None:
+      vx = target.x - self._robot_base_x
+      vy = target.y - self._robot_base_y
+      vnorm = math.hypot(vx, vy)
+      if vnorm > 1e-6:
+        ux, uy = vx / vnorm, vy / vnorm
+      else:
+        ux, uy = -1.0, 0.0
+
+      wall = Marker()
+      wall.header = Header(stamp=stamp, frame_id=self._planning_frame)
+      wall.ns = OBSTACLE_MARKER_NS
+      wall.id = TARGET_BACK_WALL_ID
+      wall.type = Marker.CUBE
+      wall.action = Marker.ADD
+      wall.pose.position.x = target.x + self._target_back_wall_offset_m * ux
+      wall.pose.position.y = target.y + self._target_back_wall_offset_m * uy
+      wall.pose.position.z = target.z
+      wall.pose.orientation = self._goal_quat_for_position((target.x, target.y, target.z))
+      wall.scale.x = self._target_back_wall_size[0]
+      wall.scale.y = self._target_back_wall_size[1]
+      wall.scale.z = self._target_back_wall_size[2]
+      wall.color = ColorRGBA(r=1.0, g=0.15, b=0.15, a=0.45)
+      arr.markers.append(wall)
     return arr
 
   def _publish_obstacles(self) -> None:
