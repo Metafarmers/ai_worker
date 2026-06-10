@@ -43,8 +43,6 @@ install(FILES
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(DIRECTORY config/model DESTINATION share/${PROJECT_NAME}/config)
-
 ################################################################################
 # Macro for ament package
 ################################################################################

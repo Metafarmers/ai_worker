@@ -11,8 +11,8 @@
         - arm_l_joint7
         - gripper_l_joint1
       step_names: [home]
-      # home: [-0.085627, 0.042807, 0.162697, -0.613939, -0.151097, -0.247222, -0.350348, 0.175741]
-      home: [0.0, 0.0, 0.0, -1.57, 0.0, 0.0, 0.0, 0.0]
+      # Match cuRobo ffw_sg2_arm_l.yml default_joint_position (collision-free in sphere model).
+      home: [1.5700000524520874, 0.0, -0.9287499785423279, 0.0, 0.0, -0.11984997987747192, 0.550000011920929, 0.550000011920929]
       duration: 5.0
       position_tolerance: 0.1
       velocity_tolerance: 0.01
@@ -32,8 +32,7 @@
         - arm_r_joint7
         - gripper_r_joint1
       step_names: [home]
-      # home: [-0.039092, -0.015699, -0.296765, -0.713672, 0.178756, -0.054947, 0.445770, 0.156432]
-      home: [0.0, 0.0, 0.0, -1.57, 0.0, 0.0, 0.0, 0.0]
+      home: [-1.5700000524520874, 0.0, -0.9287499785423279, 0.0, 0.0, 0.11984997987747192, 0.550000011920929, 0.0]
       duration: 5.0
       position_tolerance: 0.1
       velocity_tolerance: 0.01
@@ -47,7 +46,7 @@
         - head_joint1
         - head_joint2
       step_names: [home]
-      home: [0.0, 0.0]
+      home: [0.23170000314712524, 0.0]
       duration: 5.0
       position_tolerance: 0.1
       velocity_tolerance: 0.01
@@ -60,7 +59,7 @@
       joint_names:
         - lift_joint
       step_names: [home]
-      home: [0.0]
+      home: [-0.25]
       duration: 10.0
       position_tolerance: 0.1
       velocity_tolerance: 0.01

@@ -42,6 +42,18 @@ def _pose_to_curobo_pose(m: Marker) -> List[float]:
   ]
 
 
+def _sphere_marker_radius(m: Marker) -> float:
+  """RViz SPHERE marker scale is diameter (REP-103); MoveIt/cuRobo use radius."""
+  return float(m.scale.x) * 0.5
+
+
+def _sphere_marker_cuboid_dims(m: Marker, dim_scale: float = 1.0) -> List[float]:
+  """Tight axis-aligned cube around the marker sphere (matches cuRobo cuboid obstacle)."""
+  scale = max(float(dim_scale), 0.1)
+  edge = 2.0 * _sphere_marker_radius(m) * scale
+  return [edge, edge, edge]
+
+
 def markers_to_curobo_cuboids(
   msg: MarkerArray, dim_scale: float = 1.0,
 ) -> List[Dict[str, Any]]:
@@ -60,8 +72,7 @@ def markers_to_curobo_cuboids(
     if m.type == Marker.SPHERE:
       if m.scale.x <= 0.0:
         continue
-      d = float(m.scale.x) * scale
-      dims = [d, d, d]
+      dims = _sphere_marker_cuboid_dims(m, dim_scale)
     elif m.type == Marker.CUBE:
       dims = [
         float(max(m.scale.x, 1e-6)) * scale,
@@ -77,9 +88,18 @@ def markers_to_curobo_cuboids(
 
 
 def markers_to_planning_scene(
-  msg: MarkerArray, stamp, logger
+  msg: MarkerArray,
+  stamp,
+  logger,
+  *,
+  sphere_as_box: bool = True,
 ) -> Optional[PlanningScene]:
-  """Same collision-object mapping as pathplanning_node (for RViz / MoveIt scene)."""
+  """Map markers to MoveIt collision objects.
+
+  When sphere_as_box is true (default), SPHERE markers become BOX primitives with the
+  same edge length cuRobo uses. RViz obstacle markers still draw spheres, but the
+  MoveIt planning scene matches cuRobo cuboids instead of smaller sphere geometry.
+  """
   scene = PlanningScene()
   scene.is_diff = True
   count = 0
@@ -93,10 +113,14 @@ def markers_to_planning_scene(
       if m.scale.x <= 0.0:
         logger.warning(f'Skip sphere {_collision_object_id(m)}: non-positive scale.x')
         continue
-      radius = float(m.scale.x) / 2.0
       prim = SolidPrimitive()
-      prim.type = SolidPrimitive.SPHERE
-      prim.dimensions = [radius]
+      if sphere_as_box:
+        edge = 2.0 * _sphere_marker_radius(m)
+        prim.type = SolidPrimitive.BOX
+        prim.dimensions = [edge, edge, edge]
+      else:
+        prim.type = SolidPrimitive.SPHERE
+        prim.dimensions = [_sphere_marker_radius(m)]
       pose = m.pose
       frame = m.header.frame_id
     elif m.type == Marker.CUBE:
@@ -125,6 +149,43 @@ def markers_to_planning_scene(
   if count == 0:
     return None
   return scene
+
+
+def curobo_cuboids_to_marker_array(
+  cuboids: List[Dict[str, Any]],
+  stamp,
+  frame_id: str = DEFAULT_PLANNING_FRAME,
+  *,
+  namespace: str = 'curobo_obstacle_cuboid',
+) -> MarkerArray:
+  """Debug viz: exact cuboid pose/dims sent to cuRobo (wireframe cubes in RViz)."""
+  arr = MarkerArray()
+  for i, obs in enumerate(cuboids):
+    pose_vals = obs['pose']
+    dims = obs['dims']
+    m = Marker()
+    m.header.stamp = stamp
+    m.header.frame_id = frame_id
+    m.ns = namespace
+    m.id = i + 1
+    m.type = Marker.CUBE
+    m.action = Marker.ADD
+    m.pose.position.x = float(pose_vals[0])
+    m.pose.position.y = float(pose_vals[1])
+    m.pose.position.z = float(pose_vals[2])
+    m.pose.orientation.w = float(pose_vals[3])
+    m.pose.orientation.x = float(pose_vals[4])
+    m.pose.orientation.y = float(pose_vals[5])
+    m.pose.orientation.z = float(pose_vals[6])
+    m.scale.x = float(dims[0])
+    m.scale.y = float(dims[1])
+    m.scale.z = float(dims[2])
+    m.color.r = 0.1
+    m.color.g = 0.9
+    m.color.b = 0.2
+    m.color.a = 0.35
+    arr.markers.append(m)
+  return arr
 
 
 def marker_array_signature(msg: MarkerArray) -> Tuple:

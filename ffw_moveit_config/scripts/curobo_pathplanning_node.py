@@ -66,6 +66,7 @@ except ImportError as e:
 
 from curobo_obstacle_utils import (
   DEFAULT_PLANNING_FRAME,
+  curobo_cuboids_to_marker_array,
   marker_array_signature,
   markers_to_curobo_cuboids,
   markers_to_planning_scene,
@@ -161,6 +162,9 @@ class CuRoboPathPlanningNode(Node):
     self.declare_parameter('sync_moveit_scene', True)
     self.declare_parameter('send_obstacles_to_curobo', True)
     self.declare_parameter('curobo_obstacle_dim_scale', 1.0)
+    self.declare_parameter('sphere_obstacles_as_boxes_in_scene', True)
+    self.declare_parameter('publish_curobo_obstacle_debug', True)
+    self.declare_parameter('curobo_obstacle_debug_topic', '/curobo_obstacle_cuboids')
     self.declare_parameter('use_passive_defaults_for_start', True)
     self.declare_parameter('skip_start_feasibility_check', False)
     self.declare_parameter('publish_target_visualization', True)
@@ -507,6 +511,14 @@ class CuRoboPathPlanningNode(Node):
       callback_group=self._cb_group,
     )
     self.get_logger().info(f'Subscribed to {topic} (MarkerArray)')
+    if bool(self.get_parameter('publish_curobo_obstacle_debug').value):
+      debug_topic = str(self.get_parameter('curobo_obstacle_debug_topic').value)
+      self._curobo_obstacle_debug_pub = self.create_publisher(
+        MarkerArray, debug_topic, self._qos
+      )
+      self.get_logger().info(
+        f'cuRobo obstacle debug (exact cuboid dims): {debug_topic}'
+      )
 
   def _on_joint_states(self, msg: JointState) -> None:
     self._latest_joint_state = msg
@@ -550,12 +562,12 @@ class CuRoboPathPlanningNode(Node):
     positions: List[float] = []
     missing: List[str] = []
     for jn in self._curobo_state_joints:
-      if jn in passive_defaults:
-        names.append(jn)
-        positions.append(passive_defaults[jn])
-      elif jn in name_to_pos:
+      if jn in name_to_pos:
         names.append(jn)
         positions.append(float(name_to_pos[jn]))
+      elif use_passive and jn in passive_defaults:
+        names.append(jn)
+        positions.append(passive_defaults[jn])
       else:
         missing.append(jn)
     if not names:
@@ -572,6 +584,14 @@ class CuRoboPathPlanningNode(Node):
         throttle_duration_sec=30.0,
       )
     return names, positions
+
+  def _resolve_skip_start_feasibility(self) -> bool:
+    """Sim /joint_states home often fails cuRobo self-collision sphere model."""
+    if bool(self.get_parameter('skip_start_feasibility_check').value):
+      return True
+    if self.has_parameter('use_sim_time') and bool(self.get_parameter('use_sim_time').value):
+      return True
+    return False
 
   def _goal_from_pose_stamped(self, msg: PoseStamped) -> tuple:
     if msg.header.frame_id and msg.header.frame_id != self._planning_frame:
@@ -616,17 +636,35 @@ class CuRoboPathPlanningNode(Node):
       if self._last_marker_sig is not None and sig == self._last_marker_sig:
         return
 
+      obs_scale = float(self.get_parameter('curobo_obstacle_dim_scale').value)
+      sphere_as_box = bool(self.get_parameter('sphere_obstacles_as_boxes_in_scene').value)
       if bool(self.get_parameter('sync_moveit_scene').value):
         stamp = self.get_clock().now().to_msg()
-        scene = markers_to_planning_scene(msg, stamp, self.get_logger())
+        scene = markers_to_planning_scene(
+          msg, stamp, self.get_logger(), sphere_as_box=sphere_as_box
+        )
         if scene is not None and not self._call_apply_planning_scene(scene):
           return
 
       self._last_obstacle_cuboids = markers_to_curobo_cuboids(msg)
       self._last_marker_sig = sig
+      cuboid_lines = ', '.join(
+        f"{o['name']} dims={[round(d, 3) for d in o['dims']]} @"
+        f"({o['pose'][0]:.2f},{o['pose'][1]:.2f},{o['pose'][2]:.2f})"
+        for o in self._last_obstacle_cuboids[:4]
+      )
       self.get_logger().info(
         f'Obstacles for cuRobo: {len(self._last_obstacle_cuboids)} cuboid(s)'
+        f' (dim_scale={obs_scale} applied on server; {cuboid_lines})'
       )
+      if bool(self.get_parameter('publish_curobo_obstacle_debug').value):
+        stamp = self.get_clock().now().to_msg()
+        effective = markers_to_curobo_cuboids(msg, dim_scale=obs_scale)
+        debug_msg = curobo_cuboids_to_marker_array(
+          effective, stamp, frame_id=self._planning_frame
+        )
+        if hasattr(self, '_curobo_obstacle_debug_pub'):
+          self._curobo_obstacle_debug_pub.publish(debug_msg)
 
       settle = float(self.get_parameter('scene_settle_sec').value)
       if settle > 0.0:
@@ -698,9 +736,7 @@ class CuRoboPathPlanningNode(Node):
       'obstacles': self._last_obstacle_cuboids if send_obs else [],
       'obstacle_dim_scale': obs_scale,
       'max_attempts': int(self.get_parameter('max_attempts').value),
-      'skip_start_feasibility_check': bool(
-        self.get_parameter('skip_start_feasibility_check').value
-      ),
+      'skip_start_feasibility_check': self._resolve_skip_start_feasibility(),
     }
 
     lift = next(
@@ -710,7 +746,7 @@ class CuRoboPathPlanningNode(Node):
     self.get_logger().info(
       f'cuRobo plan ({reason}): target=({x:.3f},{y:.3f},{z:.3f}), '
       f'state_joints={len(state_names)}, obstacles={len(payload["obstacles"])}, '
-      f'lift_joint={lift}'
+      f'lift_joint={lift}, skip_start_check={payload["skip_start_feasibility_check"]}'
     )
     try:
       response = requests.post(self._curobo_url, json=payload, timeout=60.0)
@@ -722,9 +758,22 @@ class CuRoboPathPlanningNode(Node):
 
     if not plan.get('success', False):
       msg = plan.get('message', '')
-      if send_obs and payload['obstacles']:
+      msg_lower = msg.lower()
+      if 'self-collision' in msg_lower:
+        self.get_logger().error(
+          f'cuRobo planning failed: {msg} '
+          '(start pose vs cuRobo model; skip_start_feasibility_check:=true)'
+        )
+      elif 'trajopt' in msg_lower or 'collision-free path' in msg_lower:
+        self.get_logger().error(
+          f'cuRobo planning failed: {msg} '
+          '(usually sim arm self-collision along path, not obstacle markers — '
+          'restart curobo_plan_server after update; try higher goal z or sim home pose)'
+        )
+      elif send_obs and payload['obstacles']:
         obs_detail = ', '.join(
-          f"{o.get('name', '?')}@[{o['pose'][0]:.2f},{o['pose'][1]:.2f},{o['pose'][2]:.2f}]"
+          f"{o.get('name', '?')} dims={[round(d, 3) for d in o.get('dims', [])]} "
+          f"@[{o['pose'][0]:.2f},{o['pose'][1]:.2f},{o['pose'][2]:.2f}]"
           for o in payload['obstacles'][:3]
         )
         self.get_logger().error(

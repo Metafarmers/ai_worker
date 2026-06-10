@@ -16,27 +16,60 @@
 # Real robot example (RViz check, then Enter in terminal to execute):
 #   ros2 launch ffw_moveit_config moveit.launch.py use_sim:=false
 #   ros2 launch ffw_moveit_config curobo_planning.launch.py use_sim:=false \
-#     velocity_scale:=0.15 confirm_before_execute:=true send_obstacles_to_curobo:=false
+#     velocity_scale:=0.15 confirm_before_execute:=true skip_start_feasibility_check:=false
 
 import os
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 
 _DEFAULT_CUROBO_URL = os.environ.get('CUROBO_URL', 'http://127.0.0.1:8000/plan')
 
 
-def generate_launch_description():
-  use_sim = LaunchConfiguration('use_sim')
-  curobo_url = LaunchConfiguration('curobo_url')
-  auto_plan = LaunchConfiguration('auto_plan')
-  velocity_scale = LaunchConfiguration('velocity_scale')
-  confirm_before_execute = LaunchConfiguration('confirm_before_execute')
-  send_obstacles_to_curobo = LaunchConfiguration('send_obstacles_to_curobo')
-  move_group_namespace = LaunchConfiguration('move_group_namespace')
+def _truthy(value: str) -> bool:
+  return value.strip().lower() in ('true', '1', 'yes')
 
+
+def _launch_setup(context):
+  use_sim = _truthy(LaunchConfiguration('use_sim').perform(context))
+  skip_arg = LaunchConfiguration('skip_start_feasibility_check').perform(context).strip()
+  if skip_arg == '':
+    skip_start = use_sim
+  else:
+    skip_start = _truthy(skip_arg)
+
+  return [
+    Node(
+      package='ffw_moveit_config',
+      executable='curobo_pathplanning_node.py',
+      output='screen',
+      emulate_tty=True,
+      parameters=[{
+        'use_sim_time': use_sim,
+        'curobo_url': LaunchConfiguration('curobo_url').perform(context),
+        'auto_plan': _truthy(LaunchConfiguration('auto_plan').perform(context)),
+        'move_group_namespace': LaunchConfiguration('move_group_namespace').perform(context),
+        'velocity_scale': float(LaunchConfiguration('velocity_scale').perform(context)),
+        'confirm_before_execute': _truthy(
+          LaunchConfiguration('confirm_before_execute').perform(context)
+        ),
+        'send_obstacles_to_curobo': _truthy(
+          LaunchConfiguration('send_obstacles_to_curobo').perform(context)
+        ),
+        'curobo_obstacle_dim_scale': float(
+          LaunchConfiguration('curobo_obstacle_dim_scale').perform(context)
+        ),
+        'skip_start_feasibility_check': skip_start,
+        'use_passive_defaults_for_start': True,
+        'publish_curobo_obstacle_debug': True,
+      }],
+    ),
+  ]
+
+
+def generate_launch_description():
   return LaunchDescription([
     DeclareLaunchArgument('use_sim', default_value='true'),
     DeclareLaunchArgument(
@@ -68,19 +101,17 @@ def generate_launch_description():
         '(ExecuteTrajectory at /execute_trajectory).'
       ),
     ),
-    Node(
-      package='ffw_moveit_config',
-      executable='curobo_pathplanning_node.py',
-      output='screen',
-      emulate_tty=True,
-      parameters=[{
-        'use_sim_time': use_sim,
-        'curobo_url': curobo_url,
-        'auto_plan': auto_plan,
-        'move_group_namespace': move_group_namespace,
-        'velocity_scale': velocity_scale,
-        'confirm_before_execute': confirm_before_execute,
-        'send_obstacles_to_curobo': send_obstacles_to_curobo,
-      }],
+    DeclareLaunchArgument(
+      'curobo_obstacle_dim_scale',
+      default_value='0.92',
+      description='Shrink obstacle cuboids sent to cuRobo (reduces start false positives)',
     ),
+    DeclareLaunchArgument(
+      'skip_start_feasibility_check',
+      default_value='',
+      description=(
+        'Skip cuRobo start self-collision gate. Empty = true when use_sim:=true.'
+      ),
+    ),
+    OpaqueFunction(function=_launch_setup),
   ])
