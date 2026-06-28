@@ -212,6 +212,23 @@ def deproject_uv(
   return x, y, z
 
 
+def offset_along_camera_ray(
+  x: float,
+  y: float,
+  z: float,
+  inset_m: float,
+) -> Tuple[float, float, float]:
+  """Move a camera-frame point deeper along the view ray (origin → surface click)."""
+  inset = float(inset_m)
+  if inset <= 0.0:
+    return x, y, z
+  norm = math.sqrt(x * x + y * y + z * z)
+  if norm < 1e-9:
+    return x, y, z
+  scale = (norm + inset) / norm
+  return x * scale, y * scale, z * scale
+
+
 def project_camera_xyz_to_uv(
   x: float,
   y: float,
@@ -258,6 +275,37 @@ def depth_uv_from_color_uv(
   return u_color * scale_u, v_color * scale_v
 
 
+def sample_depth_in_mask(
+  depth_m: np.ndarray,
+  mask: np.ndarray,
+  min_depth: float,
+  max_depth: float,
+  min_pixels: int,
+  sample_mode: str = 'closest',
+) -> Optional[Tuple[float, float, float]]:
+  """Return (u, v, depth) from one consistent pixel inside the mask.
+
+  Older code took median(depth) and median(u/v) separately, which shifts small
+  objects (e.g. flowers) when the mask spans mixed depths (petal + leaf behind).
+  """
+  ys, xs = np.where(mask)
+  if ys.size == 0:
+    return None
+  vals = depth_m[ys, xs]
+  valid = np.isfinite(vals) & (vals > min_depth) & (vals < max_depth)
+  if int(valid.sum()) < min_pixels:
+    return None
+  vy = ys[valid]
+  vx = xs[valid]
+  vz = vals[valid]
+  mode = sample_mode.strip().lower()
+  if mode == 'median':
+    pick = int(np.argsort(vz)[len(vz) // 2])
+  else:
+    pick = int(np.argmin(vz))
+  return float(vx[pick]), float(vy[pick]), float(vz[pick])
+
+
 def median_depth_in_mask(
   depth_m: np.ndarray,
   mask: np.ndarray,
@@ -265,13 +313,9 @@ def median_depth_in_mask(
   max_depth: float,
   min_pixels: int,
 ) -> Optional[Tuple[float, float, float]]:
-  vals = depth_m[mask]
-  valid = vals[np.isfinite(vals) & (vals > min_depth) & (vals < max_depth)]
-  if valid.size < min_pixels:
-    return None
-  depth = float(np.median(valid))
-  ys, xs = np.where(mask)
-  return float(np.median(xs)), float(np.median(ys)), depth
+  return sample_depth_in_mask(
+    depth_m, mask, min_depth, max_depth, min_pixels, sample_mode='median',
+  )
 
 
 def detections_3d_from_segmentation(
@@ -284,6 +328,7 @@ def detections_3d_from_segmentation(
   min_depth: float,
   max_depth: float,
   min_mask_pixels: int,
+  depth_sample_mode: str = 'closest',
 ) -> List[Detection3D]:
   detections: List[Detection3D] = []
   if result.masks is None or result.boxes is None:
@@ -307,8 +352,9 @@ def detections_3d_from_segmentation(
     else:
       mask_depth = mask_color
 
-    sampled = median_depth_in_mask(
+    sampled = sample_depth_in_mask(
       depth_m, mask_depth, min_depth, max_depth, min_mask_pixels,
+      sample_mode=depth_sample_mode,
     )
     if sampled is None:
       continue
@@ -494,8 +540,8 @@ def sample_depth_at_uv(
   v0 = max(dv_i - r, 0)
   v1 = min(dv_i + r + 1, depth_h)
   patch = depth_m[v0:v1, u0:u1]
-  valid = patch[np.isfinite(patch) & (patch > min_depth) & (patch < max_depth)]
-  if valid.size == 0:
+  valid_mask = np.isfinite(patch) & (patch > min_depth) & (patch < max_depth)
+  if not np.any(valid_mask):
     return None
 
   center_val = float('nan')
@@ -503,20 +549,39 @@ def sample_depth_at_uv(
     center_val = float(depth_m[dv_i, du_i])
 
   mode = sample_mode.strip().lower()
-  if mode == 'median':
-    depth_raw = float(np.median(valid))
-  elif mode == 'center':
+  pick_du = float(du)
+  pick_dv = float(dv)
+  if mode == 'center':
     if np.isfinite(center_val) and min_depth < center_val < max_depth:
       depth_raw = center_val
     else:
-      depth_raw = float(np.min(valid))
+      flat_idx = int(np.argmin(np.where(valid_mask.ravel(), patch.ravel(), np.inf)))
+      local_v, local_u = np.unravel_index(flat_idx, patch.shape)
+      pick_du = float(u0 + local_u)
+      pick_dv = float(v0 + local_v)
+      depth_raw = float(patch[local_v, local_u])
+  elif mode == 'median':
+    flat_vals = patch[valid_mask]
+    depth_raw = float(np.median(flat_vals))
+    median_idx = int(np.argmin(np.abs(flat_vals - depth_raw)))
+    flat_idx = int(np.flatnonzero(valid_mask.ravel())[median_idx])
+    local_v, local_u = np.unravel_index(flat_idx, patch.shape)
+    pick_du = float(u0 + local_u)
+    pick_dv = float(v0 + local_v)
   else:
-    # closest — foreground click; avoids picking background behind object
-    depth_raw = float(np.min(valid))
+    # closest — foreground; deproject at the actual closest pixel, not click UV
+    flat_idx = int(np.argmin(np.where(valid_mask.ravel(), patch.ravel(), np.inf)))
+    local_v, local_u = np.unravel_index(flat_idx, patch.shape)
+    pick_du = float(u0 + local_u)
+    pick_dv = float(v0 + local_v)
+    depth_raw = float(patch[local_v, local_u])
 
   depth_val = depth_raw * float(depth_scale) + float(depth_offset_m)
+  pick_u, pick_v = color_uv_from_depth_uv(
+    pick_du, pick_dv, color_w, color_h, depth_w, depth_h,
+  )
   x, y, z = deproject_uv(
-    float(u), float(v), depth_val, camera_info, color_w, color_h, depth_is_radial,
+    pick_u, pick_v, depth_val, camera_info, color_w, color_h, depth_is_radial,
   )
   return x, y, z
 

@@ -57,6 +57,7 @@ class PerceptionTfNode(Node):
     self.declare_parameter('min_depth_m', 0.15)
     self.declare_parameter('max_depth_m', 10.0)
     self.declare_parameter('min_mask_pixels', 30)
+    self.declare_parameter('depth_sample_mode', 'closest')
     self.declare_parameter('publish_tf', True)
     self.declare_parameter('enable_det', False)
     self.declare_parameter('enable_seg_yolov11', False)
@@ -75,6 +76,7 @@ class PerceptionTfNode(Node):
     self._min_depth = float(self.get_parameter('min_depth_m').value)
     self._max_depth = float(self.get_parameter('max_depth_m').value)
     self._min_mask_pixels = int(self.get_parameter('min_mask_pixels').value)
+    self._depth_sample_mode = str(self.get_parameter('depth_sample_mode').value)
     self._publish_tf = bool(self.get_parameter('publish_tf').value)
     self._use_node_clock_stamp = bool(self.get_parameter('use_node_clock_stamp').value)
     self._tf_parent_override = str(self.get_parameter('tf_parent_frame').value).strip()
@@ -244,6 +246,7 @@ class PerceptionTfNode(Node):
           dets = detections_3d_from_segmentation(
             res, loaded.names, depth_m, camera_info, color_h, color_w,
             self._min_depth, self._max_depth, self._min_mask_pixels,
+            depth_sample_mode=self._depth_sample_mode,
           )
         else:
           dets = detections_3d_from_detection(

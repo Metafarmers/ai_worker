@@ -10,3 +10,34 @@ response_adapters:
   - default_planning_response_adapters/AddTimeOptimalParameterization
   - default_planning_response_adapters/ValidateSolution
   - default_planning_response_adapters/DisplayMotionPath
+
+planner_configs:
+  RRTConnect:
+    type: geometric::RRTConnect
+    range: 0.0
+  RRTstar:
+    type: geometric::RRTstar
+    range: 0.0
+    delay_collision_checking: 1
+
+arm_l:
+  default_planner_config: RRTConnect
+  planner_configs:
+    - RRTConnect
+arm_r:
+  default_planner_config: RRTConnect
+  planner_configs:
+    - RRTConnect
+lift:
+  default_planner_config: RRTConnect
+  planner_configs:
+    - RRTConnect
+head:
+  default_planner_config: RRTConnect
+  planner_configs:
+    - RRTConnect
+dual_arms:
+  default_planner_config: RRTConnect
+  planner_configs:
+    - RRTConnect
+    - RRTstar

@@ -46,9 +46,11 @@ from moveit_msgs.srv import GetCartesianPath
 from shape_msgs.msg import SolidPrimitive
 
 
-# Left arm planning group and tip link (from ffw.srdf / URDF)
+# Planning groups and tip links (from ffw.srdf / URDF)
 DEFAULT_GROUP = 'arm_l'
+DEFAULT_GROUP_DUAL = 'dual_arms'
 DEFAULT_EE_LINK = 'end_effector_l_link'
+DEFAULT_EE_LINK_R = 'end_effector_r_link'
 DEFAULT_PLANNING_FRAME = 'base_link'
 
 # Seven main arm joints (fixed EE joint is not actuated)
@@ -61,6 +63,8 @@ ARM_L_JOINTS = [
   'arm_l_joint6',
   'arm_l_joint7',
 ]
+ARM_R_JOINTS = [f'arm_r_joint{i}' for i in range(1, 8)]
+DUAL_ARM_JOINTS = ['lift_joint'] + ARM_L_JOINTS + ARM_R_JOINTS
 
 
 def _quat_from_rpy(roll: float, pitch: float, yaw: float) -> Quaternion:
@@ -379,17 +383,15 @@ class MoveItControlExample(Node):
 
     return self._send_move_group(req, plan_only=False)
 
-  def move_pose_goal(
+  def _pose_goal_constraints(
     self,
     x: float,
     y: float,
     z: float,
     q: Quaternion,
-    group_name: str = DEFAULT_GROUP,
-    ee_link: str = DEFAULT_EE_LINK,
+    ee_link: str,
     frame_id: str = DEFAULT_PLANNING_FRAME,
-  ) -> bool:
-    """Plan and execute to a Cartesian pose in frame_id (PTP / pose target)."""
+  ) -> Constraints:
     sphere = SolidPrimitive()
     sphere.type = SolidPrimitive.SPHERE
     sphere.dimensions = [0.01]
@@ -425,6 +427,20 @@ class MoveItControlExample(Node):
     goal_c = Constraints()
     goal_c.position_constraints.append(pc)
     goal_c.orientation_constraints.append(oc)
+    return goal_c
+
+  def move_pose_goal(
+    self,
+    x: float,
+    y: float,
+    z: float,
+    q: Quaternion,
+    group_name: str = DEFAULT_GROUP,
+    ee_link: str = DEFAULT_EE_LINK,
+    frame_id: str = DEFAULT_PLANNING_FRAME,
+  ) -> bool:
+    """Plan and execute to a Cartesian pose in frame_id (PTP / pose target)."""
+    goal_c = self._pose_goal_constraints(x, y, z, q, ee_link, frame_id)
 
     req = MotionPlanRequest()
     req.group_name = group_name
@@ -433,6 +449,49 @@ class MoveItControlExample(Node):
     req.allowed_planning_time = 15.0
     req.max_velocity_scaling_factor = 0.3
     req.max_acceleration_scaling_factor = 0.3
+
+    return self._send_move_group(req, plan_only=False)
+
+  def move_dual_joint_goal(
+    self,
+    joint_positions: list,
+    joint_names: list | None = None,
+    group_name: str = DEFAULT_GROUP_DUAL,
+  ) -> bool:
+    """Plan and execute both arms (+ lift) in joint space via dual_arms group."""
+    if joint_names is None:
+      joint_names = DUAL_ARM_JOINTS
+    return self.move_joint_goal(joint_positions, joint_names, group_name)
+
+  def move_dual_pose_goal(
+    self,
+    left_xyz: tuple,
+    left_q: Quaternion,
+    right_xyz: tuple,
+    right_q: Quaternion,
+    group_name: str = DEFAULT_GROUP_DUAL,
+    frame_id: str = DEFAULT_PLANNING_FRAME,
+  ) -> bool:
+    """Plan both EEs simultaneously (constraints on left + right in one goal)."""
+    goal_c = Constraints()
+    left_c = self._pose_goal_constraints(
+      left_xyz[0], left_xyz[1], left_xyz[2], left_q, DEFAULT_EE_LINK, frame_id
+    )
+    right_c = self._pose_goal_constraints(
+      right_xyz[0], right_xyz[1], right_xyz[2], right_q, DEFAULT_EE_LINK_R, frame_id
+    )
+    goal_c.position_constraints.extend(left_c.position_constraints)
+    goal_c.position_constraints.extend(right_c.position_constraints)
+    goal_c.orientation_constraints.extend(left_c.orientation_constraints)
+    goal_c.orientation_constraints.extend(right_c.orientation_constraints)
+
+    req = MotionPlanRequest()
+    req.group_name = group_name
+    req.goal_constraints = [goal_c]
+    req.num_planning_attempts = 15
+    req.allowed_planning_time = 25.0
+    req.max_velocity_scaling_factor = 0.25
+    req.max_acceleration_scaling_factor = 0.25
 
     return self._send_move_group(req, plan_only=False)
 
@@ -518,6 +577,24 @@ class MoveItControlExample(Node):
     w1.orientation = _quat_from_rpy(0.0, math.pi, 0.0)
     return self.move_cartesian_linear([w0, w1])
 
+  def run_demo_dual_joint(self) -> bool:
+    lift = 0.0
+    left = [-0.3, 0.4, 1.2, 1.0, 0.0, 0.4, 0.0]
+    right = [0.3, -0.4, -1.2, -1.0, 0.0, -0.4, 0.0]
+    self.get_logger().info('Demo: dual-arm joint-space motion (dual_arms group)')
+    return self.move_dual_joint_goal([lift] + left + right)
+
+  def run_demo_dual_pose(self) -> bool:
+    self.get_logger().info('Demo: dual-arm pose goal (left + right EE constraints)')
+    q_l = _quat_from_rpy(0.0, math.pi, 0.0)
+    q_r = _quat_from_rpy(0.0, math.pi, 0.0)
+    return self.move_dual_pose_goal(
+      (0.45, 0.25, 1.35),
+      q_l,
+      (0.45, -0.25, 1.35),
+      q_r,
+    )
+
 
 def main() -> int:
   rclpy.init()
@@ -526,7 +603,15 @@ def main() -> int:
   )
   parser.add_argument(
     '--mode',
-    choices=['joint', 'pose', 'cartesian', 'movel_rel', 'all'],
+    choices=[
+      'joint',
+      'pose',
+      'cartesian',
+      'movel_rel',
+      'dual_joint',
+      'dual_pose',
+      'all',
+    ],
     default='joint',
     help='Which demo to run',
   )
@@ -587,6 +672,10 @@ def main() -> int:
         args.dz,
         delta_frame=args.delta_frame,
       )
+    elif args.mode == 'dual_joint':
+      ok = node.run_demo_dual_joint()
+    elif args.mode == 'dual_pose':
+      ok = node.run_demo_dual_pose()
     else:
       ok = node.run_demo_joint()
       time.sleep(1.0)

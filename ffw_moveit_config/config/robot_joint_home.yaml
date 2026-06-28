@@ -1,0 +1,76 @@
+# Direct joint-space home poses (FollowJointTrajectory per controller).
+# Trigger: ros2 topic pub --once /curobo/joint_home std_msgs/msg/Empty "{}"
+groups:
+  - name: arm_l
+    joint_names:
+      - arm_l_joint1
+      - arm_l_joint2
+      - arm_l_joint3
+      - arm_l_joint4
+      - arm_l_joint5
+      - arm_l_joint6
+      - arm_l_joint7
+      - gripper_l_joint1
+    positions:
+      - -0.085627
+      - 0.042807
+      - 0.162697
+      - -0.613939
+      - -0.151097
+      - -0.247222
+      - -0.350348
+      - 0.175741
+    action_topic: /arm_l_controller/follow_joint_trajectory
+    duration: 5.0
+
+  - name: arm_r
+    joint_names:
+      - arm_r_joint1
+      - arm_r_joint2
+      - arm_r_joint3
+      - arm_r_joint4
+      - arm_r_joint5
+      - arm_r_joint6
+      - arm_r_joint7
+      - gripper_r_joint1
+    positions:
+      - -0.039092
+      - -0.015699
+      - -0.296765
+      - -0.713672
+      - 0.178756
+      - -0.054947
+      - 0.445770
+      - 0.156432
+    action_topic: /arm_r_controller/follow_joint_trajectory
+    duration: 5.0
+
+  - name: head
+    joint_names:
+      - head_joint1
+      - head_joint2
+    positions:
+      - 0.66
+      - -0.11
+    action_topic: /head_controller/follow_joint_trajectory
+    duration: 5.0
+
+  - name: lift
+    joint_names:
+      - lift_joint
+    positions:
+      - 0.0
+    action_topic: /lift_controller/follow_joint_trajectory
+    duration: 10.0
+
+  - name: swerve
+    joint_names:
+      - left_wheel_steer
+      - right_wheel_steer
+      - rear_wheel_steer
+    positions:
+      - 0.0
+      - 0.0
+      - 0.0
+    action_topic: /swerve_steering_initial_position_controller/follow_joint_trajectory
+    duration: 10.0

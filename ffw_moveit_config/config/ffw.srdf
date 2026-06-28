@@ -36,6 +36,11 @@
     <group name="lift">
         <joint name="lift_joint"/>
     </group>
+    <group name="dual_arms">
+        <group name="lift"/>
+        <group name="arm_l"/>
+        <group name="arm_r"/>
+    </group>
     <end_effector name="end_effector_l" parent_link="end_effector_l_link" group="arm_l"/>
     <end_effector name="end_effector_r" parent_link="end_effector_r_link" group="arm_r"/>
     <!--GROUP STATES: Purpose: Define a named state for a particular group, in terms of joint values. This is useful to define states like 'folded arms'-->
@@ -63,6 +68,23 @@
     </group_state>
     <group_state name="init" group="lift">
         <joint name="lift_joint" value="0"/>
+    </group_state>
+    <group_state name="init" group="dual_arms">
+        <joint name="lift_joint" value="0"/>
+        <joint name="arm_l_joint1" value="0"/>
+        <joint name="arm_l_joint2" value="0"/>
+        <joint name="arm_l_joint3" value="0"/>
+        <joint name="arm_l_joint4" value="0"/>
+        <joint name="arm_l_joint5" value="0"/>
+        <joint name="arm_l_joint6" value="0"/>
+        <joint name="arm_l_joint7" value="0"/>
+        <joint name="arm_r_joint1" value="0"/>
+        <joint name="arm_r_joint2" value="0"/>
+        <joint name="arm_r_joint3" value="0"/>
+        <joint name="arm_r_joint4" value="0"/>
+        <joint name="arm_r_joint5" value="0"/>
+        <joint name="arm_r_joint6" value="0"/>
+        <joint name="arm_r_joint7" value="0"/>
     </group_state>
     <!--DISABLE COLLISIONS: By default it is assumed that any link of the robot could potentially come into collision with any other link in the robot. This tag disables collision checking between a specified pair of links. -->
     <disable_collisions link1="arm_base_link" link2="arm_l_link1" reason="Adjacent"/>

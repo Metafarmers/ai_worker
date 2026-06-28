@@ -3,14 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Click on ZED image → planning frame (base_link):
-#   mode 1: target  → PoseStamped on /target_pose (EE +X→robot, +Y↑, same as curobo_pathplanning_node)
+#   mode 1: left target  → /target_pose
+#   mode 4: right target → /target_pose_r  (dual-arm cuRobo needs both)
 #   mode 2: obstacle → CUBE MarkerArray on /obstacle_markers (cuRobo cuboid)
 #   mode 3: delete nearest click
 #
 # Run (with curobo_pathplanning_node + ZED):
 #   ./scripts/run_perception_click_planning.sh
 #
-# Keys: 1=target, 2=obstacle, 3=delete, c=clear all, q=quit
+# Keys: 1=left target, 4=right target, 2=obstacle, 3=delete, c=clear all, q=quit
 
 from __future__ import annotations
 
@@ -34,26 +35,35 @@ import tf2_geometry_msgs  # noqa: F401 — registers PointStamped with tf2
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
-from curobo_obstacle_utils import quat_toward_robot_y_up
+from curobo_obstacle_utils import (
+  TARGET_BACK_WALL_CUROBO_COLLISION_X,
+  TARGET_BACK_WALL_ID,
+  append_ee_axes_markers,
+  quat_toward_robot_y_up_arm,
+  target_back_wall_center_x,
+)
 from perception_3d_utils import (
   depth_image_to_meters,
   depth_uv_from_color_uv,
+  offset_along_camera_ray,
   project_camera_xyz_to_uv,
   sample_depth_at_uv,
 )
 
-ClickMode = Literal['target', 'obstacle', 'delete']
+ClickMode = Literal['target_l', 'target_r', 'obstacle', 'delete']
 MODE_COLORS = {
-  'target': (0, 255, 0),
+  'target_l': (0, 255, 0),
+  'target_r': (0, 220, 255),
   'obstacle': (0, 0, 255),
   'delete': (0, 165, 255),
 }
 
 OBSTACLE_MARKER_NS = 'obstacle_cuboid'
 TARGET_MARKER_NS = 'click_target'
-TARGET_MARKER_ID_SPHERE = 1
-TARGET_MARKER_ID_ARROW = 2
-TARGET_BACK_WALL_ID = 1000000
+TARGET_MARKER_ID_AXES_L = 1
+TARGET_MARKER_ID_SPHERE_L = 2
+TARGET_MARKER_ID_AXES_R = 3
+TARGET_MARKER_ID_SPHERE_R = 4
 
 
 def _quat_from_yaw(yaw: float):
@@ -94,6 +104,7 @@ class PerceptionClickPlanningNode(Node):
     self.declare_parameter('planning_frame', 'base_link')
     self.declare_parameter('obstacle_topic', '/obstacle_markers')
     self.declare_parameter('target_pose_topic', '/target_pose')
+    self.declare_parameter('target_pose_r_topic', '/target_pose_r')
     self.declare_parameter('publish_target_markers', True)
     self.declare_parameter('target_marker_topic', '/curobo_target_markers')
     self.declare_parameter('min_depth_m', 0.15)
@@ -112,17 +123,24 @@ class PerceptionClickPlanningNode(Node):
     self.declare_parameter('tf_lookup_timeout_sec', 0.5)
     self.declare_parameter('robot_base_x', 0.0)
     self.declare_parameter('robot_base_y', 0.0)
+    self.declare_parameter('right_arm_roll_rad', math.pi)
     self.declare_parameter('cuboid_size_x', 0.02)
     self.declare_parameter('cuboid_size_y', 0.02)
     self.declare_parameter('cuboid_size_z', 0.02)
+    self.declare_parameter('obstacle_dim_scale', 0.6)
     self.declare_parameter('obstacle_yaw', 0.0)
     self.declare_parameter('target_arrow_length', 0.12)
     self.declare_parameter('target_sphere_diameter', 0.06)
+    self.declare_parameter(
+      'target_view_inset_m',
+      0.01,
+    )
     self.declare_parameter('enable_target_back_wall', True)
     self.declare_parameter('target_back_wall_offset_m', 0.07)
-    self.declare_parameter('target_back_wall_size_x', 0.03)
-    self.declare_parameter('target_back_wall_size_y', 0.50)
-    self.declare_parameter('target_back_wall_size_z', 0.50)
+    self.declare_parameter('target_back_wall_size_x', 0.08)
+    self.declare_parameter('target_back_wall_size_y', 2.0)
+    self.declare_parameter('target_back_wall_size_z', 1.5)
+    self.declare_parameter('target_back_wall_center_y', 0.0)
     self.declare_parameter('tf_parent_frame', '')
 
     self._planning_frame = str(self.get_parameter('planning_frame').value)
@@ -146,14 +164,23 @@ class PerceptionClickPlanningNode(Node):
       float(self.get_parameter('cuboid_size_y').value),
       float(self.get_parameter('cuboid_size_z').value),
     )
+    self._obstacle_dim_scale = max(
+      float(self.get_parameter('obstacle_dim_scale').value), 0.1
+    )
     self._obstacle_yaw = float(self.get_parameter('obstacle_yaw').value)
     self._publish_target_markers = bool(self.get_parameter('publish_target_markers').value)
+    self._target_view_inset_m = max(
+      float(self.get_parameter('target_view_inset_m').value), 0.0
+    )
     self._enable_target_back_wall = bool(self.get_parameter('enable_target_back_wall').value)
     self._target_back_wall_offset_m = float(self.get_parameter('target_back_wall_offset_m').value)
     self._target_back_wall_size = (
       max(float(self.get_parameter('target_back_wall_size_x').value), 0.01),
       max(float(self.get_parameter('target_back_wall_size_y').value), 0.01),
       max(float(self.get_parameter('target_back_wall_size_z').value), 0.01),
+    )
+    self._target_back_wall_center_y = float(
+      self.get_parameter('target_back_wall_center_y').value
     )
 
     self._bridge = CvBridge()
@@ -168,15 +195,22 @@ class PerceptionClickPlanningNode(Node):
     self._warned_tf = False
     self._logged_geometry = False
 
-    self._mode: ClickMode = 'target'
+    self._mode: ClickMode = 'target_l'
     self._pending_click: Optional[_PendingClick] = None
     self._obstacles: List[PlanningClickPoint] = []
-    self._target: Optional[PlanningClickPoint] = None
+    self._target_l: Optional[PlanningClickPoint] = None
+    self._target_r: Optional[PlanningClickPoint] = None
     self._next_obstacle_id = 0
 
     qos = QoSProfile(
       depth=10,
       durability=DurabilityPolicy.VOLATILE,
+      reliability=ReliabilityPolicy.RELIABLE,
+    )
+    # Latched planning outputs so curobo_pathplanning_node receives last click after late start.
+    planning_qos = QoSProfile(
+      depth=10,
+      durability=DurabilityPolicy.TRANSIENT_LOCAL,
       reliability=ReliabilityPolicy.RELIABLE,
     )
     reliable_qos = QoSProfile(
@@ -203,6 +237,7 @@ class PerceptionClickPlanningNode(Node):
     depth_info_topic = str(self.get_parameter('depth_camera_info_topic').value)
     obstacle_topic = str(self.get_parameter('obstacle_topic').value)
     target_topic = str(self.get_parameter('target_pose_topic').value)
+    target_r_topic = str(self.get_parameter('target_pose_r_topic').value)
 
     self.create_subscription(Image, image_topic, self._on_image, sensor_qos)
     self.create_subscription(Image, image_topic, self._on_image, reliable_qos)
@@ -210,8 +245,9 @@ class PerceptionClickPlanningNode(Node):
     self.create_subscription(CameraInfo, depth_info_topic, self._on_camera_info, camera_info_qos)
     self.create_subscription(CameraInfo, depth_info_topic, self._on_camera_info, reliable_qos)
 
-    self._obstacle_pub = self.create_publisher(MarkerArray, obstacle_topic, qos)
-    self._target_pose_pub = self.create_publisher(PoseStamped, target_topic, 10)
+    self._obstacle_pub = self.create_publisher(MarkerArray, obstacle_topic, planning_qos)
+    self._target_pose_pub = self.create_publisher(PoseStamped, target_topic, planning_qos)
+    self._target_pose_r_pub = self.create_publisher(PoseStamped, target_r_topic, planning_qos)
     if self._publish_target_markers:
       target_marker_topic = str(self.get_parameter('target_marker_topic').value)
       self._target_marker_pub = self.create_publisher(MarkerArray, target_marker_topic, qos)
@@ -236,8 +272,11 @@ class PerceptionClickPlanningNode(Node):
     self.get_logger().info(f'Camera: {image_topic}')
     self.get_logger().info(f'Planning frame: {self._planning_frame}')
     self.get_logger().info(f'Obstacle CUBE → {obstacle_topic}')
-    self.get_logger().info(f'Target PoseStamped → {target_topic}')
-    self.get_logger().info('Keys: 1=target, 2=obstacle, 3=delete, c=clear, q=quit')
+    self.get_logger().info(f'Left target  PoseStamped → {target_topic}')
+    self.get_logger().info(f'Right target PoseStamped → {target_r_topic}')
+    self.get_logger().info(
+      'Keys: 1=left target, 4=right target, 2=obstacle, 3=delete, c=clear, q=quit'
+    )
 
   def _on_mouse(self, event: int, x: int, y: int, _flags: int, _param) -> None:
     if event != cv2.EVENT_LBUTTONDOWN:
@@ -253,7 +292,8 @@ class PerceptionClickPlanningNode(Node):
   def _clear_all(self) -> None:
     with self._state_lock:
       self._obstacles.clear()
-      self._target = None
+      self._target_l = None
+      self._target_r = None
       self._next_obstacle_id = 0
     self._publish_obstacles()
     self.get_logger().info('Cleared all targets and obstacles')
@@ -332,14 +372,20 @@ class PerceptionClickPlanningNode(Node):
       )
     return None
 
-  def _goal_quat_for_position(self, xyz: Tuple[float, float, float]):
-    return quat_toward_robot_y_up(
+  def _goal_quat_for_position(
+    self, xyz: Tuple[float, float, float], arm: Literal['l', 'r'] = 'l'
+  ):
+    return quat_toward_robot_y_up_arm(
       xyz,
       robot_base_xy=(self._robot_base_x, self._robot_base_y),
+      arm=arm,
+      right_roll_rad=float(self.get_parameter('right_arm_roll_rad').value),
     )
 
-  def _make_target_pose_msg(self, pt: PlanningClickPoint, stamp) -> PoseStamped:
-    q = self._goal_quat_for_position((pt.x, pt.y, pt.z))
+  def _make_target_pose_msg(
+    self, pt: PlanningClickPoint, stamp, arm: Literal['l', 'r'] = 'l'
+  ) -> PoseStamped:
+    q = self._goal_quat_for_position((pt.x, pt.y, pt.z), arm=arm)
     msg = PoseStamped()
     msg.header.stamp = stamp
     msg.header.frame_id = self._planning_frame
@@ -352,44 +398,98 @@ class PerceptionClickPlanningNode(Node):
     msg.pose.orientation.w = float(q.w)
     return msg
 
-  def _make_target_markers(self, pt: PlanningClickPoint, stamp) -> MarkerArray:
-    pose_msg = self._make_target_pose_msg(pt, stamp)
+  def _make_target_markers(
+    self, pt: PlanningClickPoint, stamp, arm: Literal['l', 'r']
+  ) -> MarkerArray:
+    pose_msg = self._make_target_pose_msg(pt, stamp, arm=arm)
     arrow_len = float(self.get_parameter('target_arrow_length').value)
     sphere_d = float(self.get_parameter('target_sphere_diameter').value)
+    axes_id = TARGET_MARKER_ID_AXES_L if arm == 'l' else TARGET_MARKER_ID_AXES_R
+    sphere_id = TARGET_MARKER_ID_SPHERE_L if arm == 'l' else TARGET_MARKER_ID_SPHERE_R
+    color = (
+      ColorRGBA(r=0.1, g=0.85, b=0.2, a=0.85)
+      if arm == 'l'
+      else ColorRGBA(r=0.1, g=0.75, b=1.0, a=0.85)
+    )
 
-    arrow = Marker()
-    arrow.header = Header(stamp=stamp, frame_id=self._planning_frame)
-    arrow.ns = TARGET_MARKER_NS
-    arrow.id = TARGET_MARKER_ID_ARROW
-    arrow.type = Marker.ARROW
-    arrow.action = Marker.ADD
-    arrow.pose = pose_msg.pose
-    arrow.scale.x = max(arrow_len, 0.02)
-    arrow.scale.y = 0.025
-    arrow.scale.z = 0.025
-    arrow.color = ColorRGBA(r=0.1, g=0.85, b=0.25, a=0.95)
+    arr = MarkerArray()
+    append_ee_axes_markers(
+      arr,
+      stamp,
+      self._planning_frame,
+      pose_msg.pose,
+      ns=TARGET_MARKER_NS,
+      marker_id=axes_id,
+      axis_length=max(arrow_len, 0.02),
+    )
 
     sphere = Marker()
-    sphere.header = arrow.header
+    sphere.header = Header(stamp=stamp, frame_id=self._planning_frame)
     sphere.ns = TARGET_MARKER_NS
-    sphere.id = TARGET_MARKER_ID_SPHERE
+    sphere.id = sphere_id
     sphere.type = Marker.SPHERE
     sphere.action = Marker.ADD
     sphere.pose = pose_msg.pose
     sphere.scale.x = sphere_d
     sphere.scale.y = sphere_d
     sphere.scale.z = sphere_d
-    sphere.color = ColorRGBA(r=0.1, g=0.55, b=1.0, a=0.75)
+    sphere.color = color
 
-    arr = MarkerArray()
-    arr.markers.append(arrow)
     arr.markers.append(sphere)
     return arr
+
+  def _wall_near_face_x(self, target_x: float) -> float:
+    """YZ-parallel slab face just past target (away from robot base along +X)."""
+    offset = self._target_back_wall_offset_m
+    if target_x >= self._robot_base_x:
+      return target_x + offset
+    return target_x - offset
+
+  def _append_target_back_wall(
+    self,
+    arr: MarkerArray,
+    stamp,
+    target: PlanningClickPoint,
+    wall_id: int,
+  ) -> None:
+    # Full YZ slab at X behind left target (both arms must not cross this plane).
+    wall = Marker()
+    wall.header = Header(stamp=stamp, frame_id=self._planning_frame)
+    wall.ns = OBSTACLE_MARKER_NS
+    wall.id = wall_id
+    wall.type = Marker.CUBE
+    wall.action = Marker.ADD
+    # Center cuboid so the near face is at target+offset (target stays outside the wall).
+    wall.pose.position.x = target_back_wall_center_x(
+      self._wall_near_face_x(target.x),
+    )
+    wall.pose.position.y = self._target_back_wall_center_y
+    wall.pose.position.z = target.z
+    wall.pose.orientation.w = 1.0
+    wall.scale.x = TARGET_BACK_WALL_CUROBO_COLLISION_X
+    wall.scale.y = self._target_back_wall_size[1]
+    wall.scale.z = self._target_back_wall_size[2]
+    wall.color = ColorRGBA(r=1.0, g=0.15, b=0.15, a=0.45)
+    arr.markers.append(wall)
+
+  def _back_wall_anchor_target(
+    self,
+    target_l: Optional[PlanningClickPoint],
+    target_r: Optional[PlanningClickPoint],
+  ) -> Optional[PlanningClickPoint]:
+    """Pick the target farthest along +X so the wall sits behind every goal."""
+    candidates = [t for t in (target_l, target_r) if t is not None]
+    if not candidates:
+      return None
+    if len(candidates) == 1:
+      return candidates[0]
+    return max(candidates, key=lambda t: float(t.x))
 
   def _build_obstacle_markers(self, stamp) -> MarkerArray:
     with self._state_lock:
       obstacles = list(self._obstacles)
-      target = self._target
+      target_l = self._target_l
+      target_r = self._target_r
 
     arr = MarkerArray()
     delete_all = Marker()
@@ -397,6 +497,7 @@ class PerceptionClickPlanningNode(Node):
     arr.markers.append(delete_all)
 
     sx, sy, sz = self._cuboid_size
+    obs_scale = self._obstacle_dim_scale
     orient = _quat_from_yaw(self._obstacle_yaw)
     for pt in obstacles:
       m = Marker()
@@ -409,64 +510,53 @@ class PerceptionClickPlanningNode(Node):
       m.pose.position.y = pt.y
       m.pose.position.z = pt.z
       m.pose.orientation = orient
-      m.scale.x = sx
-      m.scale.y = sy
-      m.scale.z = sz
+      m.scale.x = sx * obs_scale
+      m.scale.y = sy * obs_scale
+      m.scale.z = sz * obs_scale
       m.color = ColorRGBA(r=1.0, g=0.4, b=0.1, a=0.85)
       arr.markers.append(m)
 
-    # Optional virtual wall: place a thin cuboid 1cm behind the target.
-    if self._enable_target_back_wall and target is not None:
-      vx = target.x - self._robot_base_x
-      vy = target.y - self._robot_base_y
-      vnorm = math.hypot(vx, vy)
-      if vnorm > 1e-6:
-        ux, uy = vx / vnorm, vy / vnorm
-      else:
-        ux, uy = -1.0, 0.0
-
-      wall = Marker()
-      wall.header = Header(stamp=stamp, frame_id=self._planning_frame)
-      wall.ns = OBSTACLE_MARKER_NS
-      wall.id = TARGET_BACK_WALL_ID
-      wall.type = Marker.CUBE
-      wall.action = Marker.ADD
-      wall.pose.position.x = target.x + self._target_back_wall_offset_m * ux
-      wall.pose.position.y = target.y + self._target_back_wall_offset_m * uy
-      wall.pose.position.z = target.z
-      wall.pose.orientation = self._goal_quat_for_position((target.x, target.y, target.z))
-      wall.scale.x = self._target_back_wall_size[0]
-      wall.scale.y = self._target_back_wall_size[1]
-      wall.scale.z = self._target_back_wall_size[2]
-      wall.color = ColorRGBA(r=1.0, g=0.15, b=0.15, a=0.45)
-      arr.markers.append(wall)
+    # Virtual wall: YZ slab behind the deepest (+X) target; both arms must avoid it in cuRobo.
+    wall_anchor = self._back_wall_anchor_target(target_l, target_r)
+    if self._enable_target_back_wall and wall_anchor is not None:
+      self._append_target_back_wall(arr, stamp, wall_anchor, TARGET_BACK_WALL_ID)
     return arr
 
   def _publish_obstacles(self) -> None:
     stamp = self.get_clock().now().to_msg()
     self._obstacle_pub.publish(self._build_obstacle_markers(stamp))
 
-  def _publish_target(self) -> None:
+  def _publish_arm_target(self, arm: Literal['l', 'r']) -> None:
     with self._state_lock:
-      target = self._target
-    if target is None:
+      pt = self._target_l if arm == 'l' else self._target_r
+    if pt is None:
       return
     stamp = self.get_clock().now().to_msg()
-    pose_msg = self._make_target_pose_msg(target, stamp)
-    self._target_pose_pub.publish(pose_msg)
+    pose_msg = self._make_target_pose_msg(pt, stamp, arm=arm)
+    if arm == 'l':
+      self._target_pose_pub.publish(pose_msg)
+    else:
+      self._target_pose_r_pub.publish(pose_msg)
     if self._target_marker_pub is not None:
-      self._target_marker_pub.publish(self._make_target_markers(target, stamp))
+      self._target_marker_pub.publish(self._make_target_markers(pt, stamp, arm))
+
+  def _publish_targets(self) -> None:
+    self._publish_arm_target('l')
+    self._publish_arm_target('r')
 
   def _republish_planning_outputs(self) -> None:
     self._publish_obstacles()
-    self._publish_target()
+    self._publish_targets()
 
   def _delete_nearest(self, u: int, v: int) -> None:
     with self._state_lock:
       candidates: List[Tuple[float, PlanningClickPoint, str]] = []
-      if self._target is not None:
-        d = math.hypot(self._target.u - u, self._target.v - v)
-        candidates.append((d, self._target, 'target'))
+      if self._target_l is not None:
+        d = math.hypot(self._target_l.u - u, self._target_l.v - v)
+        candidates.append((d, self._target_l, 'target_l'))
+      if self._target_r is not None:
+        d = math.hypot(self._target_r.u - u, self._target_r.v - v)
+        candidates.append((d, self._target_r, 'target_r'))
       for obs in self._obstacles:
         d = math.hypot(obs.u - u, obs.v - v)
         candidates.append((d, obs, 'obstacle'))
@@ -482,15 +572,18 @@ class PerceptionClickPlanningNode(Node):
         )
         return
 
-      if kind == 'target':
-        self._target = None
-        self.get_logger().info('Deleted target')
+      if kind == 'target_l':
+        self._target_l = None
+        self.get_logger().info('Deleted left target')
+      elif kind == 'target_r':
+        self._target_r = None
+        self.get_logger().info('Deleted right target')
       else:
         self._obstacles = [o for o in self._obstacles if o.point_id != pt.point_id]
         self.get_logger().info(f'Deleted obstacle_{pt.point_id}')
 
     self._publish_obstacles()
-    self._publish_target()
+    self._publish_targets()
 
   def _log_geometry_once(
     self,
@@ -560,30 +653,47 @@ class PerceptionClickPlanningNode(Node):
     valid = patch[np.isfinite(patch) & (patch > self._min_depth) & (patch < self._max_depth)]
 
     cx, cy, cz = xyz_cam
+    surface_cam = (cx, cy, cz)
+    if mode in ('target_l', 'target_r') and self._target_view_inset_m > 0.0:
+      cx, cy, cz = offset_along_camera_ray(cx, cy, cz, self._target_view_inset_m)
     xyz_plan = self._transform_camera_xyz_to_planning(cx, cy, cz, camera_frame, stamp)
     if xyz_plan is None:
       return
     x, y, z = xyz_plan
 
+    inset_note = ''
+    if mode in ('target_l', 'target_r') and self._target_view_inset_m > 0.0:
+      inset_note = f', view_inset={self._target_view_inset_m:.3f}m into object'
+
     self.get_logger().info(
-      f'Click ({click.u},{click.v}): depth_used={cz:.3f}m '
+      f'Click ({click.u},{click.v}): depth_used={surface_cam[2]:.3f}m '
       f'(center={center_d:.3f} closest={float(np.min(valid)):.3f} '
       f'median={float(np.median(valid)):.3f}) '
-      f'cam=({cx:.3f},{cy:.3f},{cz:.3f}) {camera_frame} → '
-      f'{self._planning_frame}=({x:.3f},{y:.3f},{z:.3f})'
+      f'surface_cam=({surface_cam[0]:.3f},{surface_cam[1]:.3f},{surface_cam[2]:.3f}) '
+      f'→ target {self._planning_frame}=({x:.3f},{y:.3f},{z:.3f}){inset_note}'
     )
 
-    if mode == 'target':
+    if mode in ('target_l', 'target_r'):
+      arm: Literal['l', 'r'] = 'l' if mode == 'target_l' else 'r'
       pt = PlanningClickPoint(
         kind='target', point_id=0, u=click.u, v=click.v, x=x, y=y, z=z,
       )
       with self._state_lock:
-        self._target = pt
-      self.get_logger().info(
-        f'Target {self._planning_frame}=({x:.3f}, {y:.3f}, {z:.3f}) '
-        f'(EE +X→robot, +Y↑)'
+        if arm == 'l':
+          self._target_l = pt
+        else:
+          self._target_r = pt
+      label = 'Left' if arm == 'l' else 'Right'
+      topic = (
+        self.get_parameter('target_pose_topic').value
+        if arm == 'l'
+        else self.get_parameter('target_pose_r_topic').value
       )
-      self._publish_target()
+      self.get_logger().info(
+        f'{label} target {self._planning_frame}=({x:.3f}, {y:.3f}, {z:.3f}) → {topic}'
+      )
+      self._publish_obstacles()
+      self._publish_arm_target(arm)
       return
 
     with self._state_lock:
@@ -642,14 +752,21 @@ class PerceptionClickPlanningNode(Node):
     out = canvas.copy()
     with self._state_lock:
       mode = self._mode
-      target = self._target
+      target_l = self._target_l
+      target_r = self._target_r
       obstacles = list(self._obstacles)
 
-    if target is not None:
-      cv2.circle(out, (target.u, target.v), 10, MODE_COLORS['target'], 2)
+    if target_l is not None:
+      cv2.circle(out, (target_l.u, target_l.v), 10, MODE_COLORS['target_l'], 2)
       cv2.putText(
-        out, 'T', (target.u + 12, target.v - 6),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.6, MODE_COLORS['target'], 2, cv2.LINE_AA,
+        out, 'L', (target_l.u + 12, target_l.v - 6),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, MODE_COLORS['target_l'], 2, cv2.LINE_AA,
+      )
+    if target_r is not None:
+      cv2.circle(out, (target_r.u, target_r.v), 10, MODE_COLORS['target_r'], 2)
+      cv2.putText(
+        out, 'R', (target_r.u + 12, target_r.v - 6),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, MODE_COLORS['target_r'], 2, cv2.LINE_AA,
       )
     for obs in obstacles:
       cv2.circle(out, (obs.u, obs.v), 8, MODE_COLORS['obstacle'], 2)
@@ -661,7 +778,8 @@ class PerceptionClickPlanningNode(Node):
     if self._show_reprojection and camera_info is not None and camera_frame:
       color_h, color_w = out.shape[:2]
       reproj_color = (0, 255, 255)
-      for pt in ([target] if target else []) + obstacles:
+      targets = [t for t in (target_l, target_r) if t is not None]
+      for pt in targets + obstacles:
         uv = self._plan_point_to_camera_uv(
           pt.x, pt.y, pt.z, camera_frame, camera_info, color_w, color_h, stamp,
         )
@@ -676,8 +794,8 @@ class PerceptionClickPlanningNode(Node):
           cv2.line(out, (pt.u, pt.v), (ru, rv), reproj_color, 1, cv2.LINE_AA)
 
     lines = [
-      f'Mode [1=target 2=obstacle 3=delete]: {mode.upper()}',
-      f'Target: {"yes" if target else "no"} | Obstacles: {len(obstacles)}',
+      f'Mode [1=L 4=R 2=obs 3=del]: {mode.upper()}',
+      f'L:{"yes" if target_l else "no"} R:{"yes" if target_r else "no"} | Obs: {len(obstacles)}',
       f'Frame: {self._planning_frame} | depth={self._depth_sample_mode} scale={self._depth_scale}',
       'Green/red=c click | yellow x=reproject from base_link',
       'Left-click | c=clear | q=quit',
@@ -693,8 +811,13 @@ class PerceptionClickPlanningNode(Node):
     if not self._show_window:
       return True
     key = cv2.waitKey(1) & 0xFF
-    if key in (ord('1'), ord('2'), ord('3')):
-      self._set_mode({ord('1'): 'target', ord('2'): 'obstacle', ord('3'): 'delete'}[key])
+    if key in (ord('1'), ord('2'), ord('3'), ord('4')):
+      self._set_mode({
+        ord('1'): 'target_l',
+        ord('4'): 'target_r',
+        ord('2'): 'obstacle',
+        ord('3'): 'delete',
+      }[key])
     elif key in (ord('c'), ord('C')):
       self._clear_all()
     elif key in (ord('q'), ord('Q'), 27):
