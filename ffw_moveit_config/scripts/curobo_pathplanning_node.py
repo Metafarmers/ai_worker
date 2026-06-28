@@ -54,19 +54,34 @@ from typing import Dict, List, Optional
 
 import yaml
 import rclpy
+import tf2_ros
 from ament_index_python.packages import get_package_share_directory
 from control_msgs.action import FollowJointTrajectory
 from rclpy.action import ActionClient
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 
-from geometry_msgs.msg import Pose, PoseStamped, Quaternion
+from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
 from std_msgs.msg import ColorRGBA, Empty, Header
-from moveit_msgs.action import ExecuteTrajectory
-from moveit_msgs.msg import DisplayTrajectory, MoveItErrorCodes, RobotState, RobotTrajectory
-from moveit_msgs.srv import ApplyPlanningScene
+from moveit_msgs.action import ExecuteTrajectory, MoveGroup
+from moveit_msgs.msg import (
+  BoundingVolume,
+  Constraints,
+  DisplayTrajectory,
+  MoveItErrorCodes,
+  MotionPlanRequest,
+  OrientationConstraint,
+  PlanningOptions,
+  PositionConstraint,
+  RobotState,
+  RobotTrajectory,
+)
+from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath
+from shape_msgs.msg import SolidPrimitive
+from geometry_msgs.msg import Vector3
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import Marker, MarkerArray
@@ -221,10 +236,16 @@ DEFAULT_JOINT_HOME_GROUPS: List[dict] = [
 
 TARGET_MARKER_NS_L = 'curobo_target_l'
 TARGET_MARKER_NS_R = 'curobo_target_r'
+TARGET_CONTACT_NS_L = 'curobo_contact_l'
+TARGET_CONTACT_NS_R = 'curobo_contact_r'
 TARGET_MARKER_ID_L_AXES = 0
 TARGET_MARKER_ID_L_SPHERE = 1
 TARGET_MARKER_ID_R_AXES = 2
 TARGET_MARKER_ID_R_SPHERE = 3
+TARGET_MARKER_ID_L_CONTACT = 0
+TARGET_MARKER_ID_L_CONTACT_LINE = 1
+TARGET_MARKER_ID_R_CONTACT = 0
+TARGET_MARKER_ID_R_CONTACT_LINE = 1
 GOAL_POSITION_EPS_M = 1e-4
 
 
@@ -263,6 +284,22 @@ class CuRoboPathPlanningNode(Node):
     self.declare_parameter('plan_debounce_sec', 0.35)
     self.declare_parameter('goal_pose_topic', '/target_pose')
     self.declare_parameter('goal_pose_r_topic', '/target_pose_r')
+    self.declare_parameter('goal_pose_contact_topic', '/target_pose_contact')
+    self.declare_parameter('goal_pose_contact_r_topic', '/target_pose_contact_r')
+    self.declare_parameter('enable_final_tool_approach', True)
+    self.declare_parameter('final_approach_use_move_group', True)
+    self.declare_parameter('final_approach_tool_m', 0.08)
+    self.declare_parameter('final_approach_tool_axis', 'z')
+    self.declare_parameter('final_approach_steps', 4)
+    self.declare_parameter('final_approach_max_step', 0.005)
+    self.declare_parameter('final_approach_velocity_scale', 0.15)
+    self.declare_parameter('final_approach_goal_tolerance_m', 0.008)
+    self.declare_parameter('final_approach_planning_time', 10.0)
+    self.declare_parameter('final_approach_planning_attempts', 8)
+    # Max EE→contact distance to attempt STAGE 2 (cuRobo may stop short of pre-grasp).
+    self.declare_parameter('final_approach_max_distance_m', 0.35)
+    self.declare_parameter('final_approach_settle_sec', 1.0)
+    self.declare_parameter('final_approach_tf_timeout_sec', 0.5)
     self.declare_parameter('curobo_robot_file_l', DEFAULT_CUROBO_ROBOT_FILE_L)
     self.declare_parameter('curobo_robot_file_r', DEFAULT_CUROBO_ROBOT_FILE_R)
     self.declare_parameter('planning_frame', DEFAULT_PLANNING_FRAME)
@@ -304,6 +341,8 @@ class CuRoboPathPlanningNode(Node):
     self.declare_parameter('publish_target_visualization', True)
     self.declare_parameter('target_marker_topic', '/curobo_target_markers')
     self.declare_parameter('target_pose_viz_topic', '/curobo_target_pose')
+    self.declare_parameter('target_contact_pose_viz_topic', '/curobo_target_pose_contact')
+    self.declare_parameter('target_contact_pose_viz_r_topic', '/curobo_target_pose_contact_r')
     self.declare_parameter('target_marker_publish_period_sec', 1.0)
     self.declare_parameter('target_arrow_length', 0.12)
     self.declare_parameter('target_show_ee_axes', True)
@@ -322,7 +361,9 @@ class CuRoboPathPlanningNode(Node):
     self.declare_parameter('display_planned_path_topic', '/display_planned_path')
     self.declare_parameter('robot_model_id', 'ffw')
     self.declare_parameter('display_path_publish_count', 3)
-    self.declare_parameter('wait_for_joint_states_sec', 30.0)
+    self.declare_parameter('wait_for_joint_states_sec', 0.0)
+    self.declare_parameter('require_joint_states_at_startup', False)
+    self.declare_parameter('joint_state_best_effort_qos', True)
     self.declare_parameter('joint_state_stale_sec', 0.5)
     self.declare_parameter('joint_state_stamp_tolerance_sec', 2.0)
 
@@ -377,32 +418,51 @@ class CuRoboPathPlanningNode(Node):
     self._cached_goal_l_quat = None
     self._cached_goal_r_xyz: Optional[tuple[float, float, float]] = None
     self._cached_goal_r_quat = None
+    self._cached_contact_l_xyz: Optional[tuple[float, float, float]] = None
+    self._cached_contact_l_quat = None
+    self._cached_contact_r_xyz: Optional[tuple[float, float, float]] = None
+    self._cached_contact_r_quat = None
     self._plan_debounce_timer = None
     self._pending_plan_reason: Optional[str] = None
     self._pending_plan_fire_mono: float = 0.0
     self._planning_armed = False
     self._readiness_poll_timer = None
     self._readiness_was_ready = False
+    self._tf_buffer = tf2_ros.Buffer()
+    self._tf_listener = tf2_ros.TransformListener(
+      self._tf_buffer, self, spin_thread=True
+    )
 
     srv = self._resolve_apply_scene_service()
     self._apply_scene_cli = self.create_client(
       ApplyPlanningScene, srv, callback_group=self._cb_group
     )
     self.get_logger().info(f'ApplyPlanningScene service: {srv}')
+    cartesian_srv = self._resolve_cartesian_path_service()
+    self._cartesian_path_cli = self.create_client(
+      GetCartesianPath, cartesian_srv, callback_group=self._cb_group
+    )
+    self.get_logger().info(f'GetCartesianPath service: {cartesian_srv}')
 
     raw = str(self.get_parameter('move_group_namespace').value).strip()
     low = raw.lower()
     if low in ('', 'root', '/'):
       exec_name = '/execute_trajectory'
+      move_action_name = '/move_action'
     else:
       ns = raw if raw.startswith('/') else '/' + raw
       ns = ns.rstrip('/') or '/move_group'
       exec_name = f'{ns}/execute_trajectory'
+      move_action_name = f'{ns}/move_action'
 
     self._execute = ActionClient(
       self, ExecuteTrajectory, exec_name, callback_group=self._cb_group
     )
+    self._move_group = ActionClient(
+      self, MoveGroup, move_action_name, callback_group=self._cb_group
+    )
     self.get_logger().info(f'ExecuteTrajectory action: {exec_name}')
+    self.get_logger().info(f'MoveGroup action: {move_action_name}')
 
     self._qos = QoSProfile(
       depth=10,
@@ -415,11 +475,16 @@ class CuRoboPathPlanningNode(Node):
       durability=DurabilityPolicy.TRANSIENT_LOCAL,
       reliability=ReliabilityPolicy.RELIABLE,
     )
-    self._js_qos = QoSProfile(
-      depth=10,
-      durability=DurabilityPolicy.VOLATILE,
-      reliability=ReliabilityPolicy.RELIABLE,
-    )
+    if bool(self.get_parameter('joint_state_best_effort_qos').value):
+      self._js_qos = qos_profile_sensor_data
+      js_qos_label = 'BEST_EFFORT (sensor_data)'
+    else:
+      self._js_qos = QoSProfile(
+        depth=10,
+        durability=DurabilityPolicy.VOLATILE,
+        reliability=ReliabilityPolicy.RELIABLE,
+      )
+      js_qos_label = 'RELIABLE, VOLATILE'
 
     js_topic = str(self.get_parameter('joint_state_topic').value)
     self.create_subscription(
@@ -429,7 +494,7 @@ class CuRoboPathPlanningNode(Node):
       self._js_qos,
       callback_group=self._cb_group,
     )
-    self.get_logger().info(f'Subscribed to {js_topic} (RELIABLE, VOLATILE)')
+    self.get_logger().info(f'Subscribed to {js_topic} ({js_qos_label})')
 
     display_topic = str(self.get_parameter('display_planned_path_topic').value).strip()
     self._display_path_pub = self.create_publisher(
@@ -510,6 +575,40 @@ class CuRoboPathPlanningNode(Node):
         )
         self.get_logger().info(f'Right-arm goals on {goal_r_topic}')
 
+    contact_topic = str(self.get_parameter('goal_pose_contact_topic').value).strip()
+    if contact_topic and self._planning_mode in ('left', 'dual'):
+      self.create_subscription(
+        PoseStamped,
+        contact_topic,
+        self._on_goal_contact_l,
+        self._planning_input_qos,
+        callback_group=self._cb_group,
+      )
+      self.get_logger().info(f'Left contact on {contact_topic}')
+    if self._planning_mode in ('right', 'dual'):
+      contact_r_topic = str(
+        self.get_parameter('goal_pose_contact_r_topic').value
+      ).strip()
+      if contact_r_topic:
+        self.create_subscription(
+          PoseStamped,
+          contact_r_topic,
+          self._on_goal_contact_r,
+          self._planning_input_qos,
+          callback_group=self._cb_group,
+        )
+        self.get_logger().info(f'Right contact on {contact_r_topic}')
+
+    if bool(self.get_parameter('enable_final_tool_approach').value):
+      max_dist = float(self.get_parameter('final_approach_max_distance_m').value)
+      use_mg = bool(self.get_parameter('final_approach_use_move_group').value)
+      settle = float(self.get_parameter('final_approach_settle_sec').value)
+      self.get_logger().info(
+        '[MoveIt] STAGE 2: plan to clicked contact pose from current EE '
+        f'(MoveGroup={"yes" if use_mg else "Cartesian only"}, '
+        f'max EE→contact={max_dist:.2f}m, pause {settle:.1f}s after cuRobo)'
+      )
+
     dual_seq = self._dual_sequence_mode() if self._planning_mode == 'dual' else 'n/a'
     self.get_logger().info(
       f'planning_mode={self._planning_mode}, dual_sequence={dual_seq}, '
@@ -583,6 +682,14 @@ class CuRoboPathPlanningNode(Node):
       return '/apply_planning_scene'
     ns = raw if raw.startswith('/') else '/' + raw
     return f'{ns.rstrip("/")}/apply_planning_scene'
+
+  def _resolve_cartesian_path_service(self) -> str:
+    raw = str(self.get_parameter('move_group_namespace').value).strip()
+    low = raw.lower()
+    if low in ('', 'root', '/'):
+      return '/compute_cartesian_path'
+    ns = raw if raw.startswith('/') else '/' + raw
+    return f'{ns.rstrip("/")}/compute_cartesian_path'
 
   def _goal_quat_for_position(
     self, xyz: tuple[float, float, float], arm: str = 'l'
@@ -730,15 +837,37 @@ class CuRoboPathPlanningNode(Node):
       return
     marker_topic = str(self.get_parameter('target_marker_topic').value).strip()
     pose_topic = str(self.get_parameter('target_pose_viz_topic').value).strip()
+    contact_pose_topic = str(
+      self.get_parameter('target_contact_pose_viz_topic').value
+    ).strip()
+    contact_pose_r_topic = str(
+      self.get_parameter('target_contact_pose_viz_r_topic').value
+    ).strip()
     self._target_marker_pub = self.create_publisher(MarkerArray, marker_topic, self._qos)
     self._target_pose_pub = self.create_publisher(PoseStamped, pose_topic, 10)
+    self._target_contact_pose_pub = None
+    self._target_contact_pose_r_pub = None
+    if contact_pose_topic:
+      self._target_contact_pose_pub = self.create_publisher(
+        PoseStamped, contact_pose_topic, 10
+      )
+    if contact_pose_r_topic:
+      self._target_contact_pose_r_pub = self.create_publisher(
+        PoseStamped, contact_pose_r_topic, 10
+      )
     period = float(self.get_parameter('target_marker_publish_period_sec').value)
     self._publish_target_visualization()
     if period > 0.0:
       self.create_timer(period, self._publish_target_visualization)
+    contact_note = ''
+    if contact_pose_topic:
+      contact_note = f', contact PoseStamped "{contact_pose_topic}"'
+    if contact_pose_r_topic:
+      contact_note += f' / "{contact_pose_r_topic}"'
     self.get_logger().info(
-      f'Target RViz: MarkerArray "{marker_topic}", PoseStamped "{pose_topic}" '
-      f'(frame={self._planning_frame})'
+      f'Target RViz: MarkerArray "{marker_topic}" '
+      f'(cuRobo pre-grasp + contact), approach PoseStamped "{pose_topic}"'
+      f'{contact_note} (frame={self._planning_frame})'
     )
 
   @staticmethod
@@ -794,6 +923,59 @@ class CuRoboPathPlanningNode(Node):
     sphere.color = sphere_color
     arr.markers.append(sphere)
 
+  def _append_contact_target_markers(
+    self,
+    arr: MarkerArray,
+    stamp,
+    frame: str,
+    approach_xyz: tuple[float, float, float],
+    contact_xyz: tuple[float, float, float],
+    contact_quat,
+    *,
+    ns: str,
+    contact_id: int,
+    line_id: int,
+    contact_color: ColorRGBA,
+  ) -> None:
+    sphere_d = float(self.get_parameter('target_sphere_diameter').value)
+    contact_pose = self._pose_from_goal(contact_xyz, contact_quat)
+
+    contact_sphere = Marker()
+    contact_sphere.header = Header(stamp=stamp, frame_id=frame)
+    contact_sphere.ns = ns
+    contact_sphere.id = contact_id
+    contact_sphere.type = Marker.SPHERE
+    contact_sphere.action = Marker.ADD
+    contact_sphere.pose = contact_pose
+    d = sphere_d * 0.7
+    contact_sphere.scale.x = d
+    contact_sphere.scale.y = d
+    contact_sphere.scale.z = d
+    contact_sphere.color = contact_color
+    arr.markers.append(contact_sphere)
+
+    ax, ay, az = approach_xyz
+    cx, cy, cz = contact_xyz
+    line = Marker()
+    line.header = Header(stamp=stamp, frame_id=frame)
+    line.ns = ns
+    line.id = line_id
+    line.type = Marker.LINE_STRIP
+    line.action = Marker.ADD
+    line.scale.x = max(sphere_d * 0.08, 0.003)
+    line.color = ColorRGBA(
+      r=contact_color.r,
+      g=contact_color.g,
+      b=contact_color.b,
+      a=min(contact_color.a, 0.75),
+    )
+    p0 = Point()
+    p0.x, p0.y, p0.z = float(ax), float(ay), float(az)
+    p1 = Point()
+    p1.x, p1.y, p1.z = float(cx), float(cy), float(cz)
+    line.points = [p0, p1]
+    arr.markers.append(line)
+
   def _make_target_markers(self, stamp) -> MarkerArray:
     frame = self._planning_frame
     arr = MarkerArray()
@@ -812,6 +994,19 @@ class CuRoboPathPlanningNode(Node):
         arrow_color=ColorRGBA(r=0.1, g=0.85, b=0.25, a=0.95),
         sphere_color=ColorRGBA(r=0.1, g=0.55, b=1.0, a=0.75),
       )
+      if self._cached_contact_l_xyz and self._cached_contact_l_quat:
+        self._append_contact_target_markers(
+          arr,
+          stamp,
+          frame,
+          self._cached_goal_l_xyz,
+          self._cached_contact_l_xyz,
+          self._cached_contact_l_quat,
+          ns=TARGET_CONTACT_NS_L,
+          contact_id=TARGET_MARKER_ID_L_CONTACT,
+          line_id=TARGET_MARKER_ID_L_CONTACT_LINE,
+          contact_color=ColorRGBA(r=0.95, g=0.95, b=0.2, a=0.95),
+        )
     if self._goal_r_ready and self._cached_goal_r_xyz and self._cached_goal_r_quat:
       self._append_target_markers(
         arr,
@@ -827,6 +1022,19 @@ class CuRoboPathPlanningNode(Node):
         arrow_color=ColorRGBA(r=0.95, g=0.45, b=0.1, a=0.95),
         sphere_color=ColorRGBA(r=1.0, g=0.55, b=0.1, a=0.75),
       )
+      if self._cached_contact_r_xyz and self._cached_contact_r_quat:
+        self._append_contact_target_markers(
+          arr,
+          stamp,
+          frame,
+          self._cached_goal_r_xyz,
+          self._cached_contact_r_xyz,
+          self._cached_contact_r_quat,
+          ns=TARGET_CONTACT_NS_R,
+          contact_id=TARGET_MARKER_ID_R_CONTACT,
+          line_id=TARGET_MARKER_ID_R_CONTACT_LINE,
+          contact_color=ColorRGBA(r=0.95, g=0.85, b=0.2, a=0.95),
+        )
     return arr
 
   def _publish_target_visualization(self) -> None:
@@ -847,6 +1055,36 @@ class CuRoboPathPlanningNode(Node):
         self._quat_for_viz(self._cached_goal_l_xyz, self._cached_goal_l_quat, 'l'),
       )
       self._target_pose_pub.publish(pose_msg)
+    if (
+      self._target_contact_pose_pub is not None
+      and self._cached_contact_l_xyz is not None
+      and self._cached_contact_l_quat is not None
+    ):
+      contact_msg = PoseStamped()
+      contact_msg.header.stamp = stamp
+      contact_msg.header.frame_id = self._planning_frame
+      contact_msg.pose = self._pose_from_goal(
+        self._cached_contact_l_xyz,
+        self._quat_for_viz(
+          self._cached_contact_l_xyz, self._cached_contact_l_quat, 'l'
+        ),
+      )
+      self._target_contact_pose_pub.publish(contact_msg)
+    if (
+      self._target_contact_pose_r_pub is not None
+      and self._cached_contact_r_xyz is not None
+      and self._cached_contact_r_quat is not None
+    ):
+      contact_r_msg = PoseStamped()
+      contact_r_msg.header.stamp = stamp
+      contact_r_msg.header.frame_id = self._planning_frame
+      contact_r_msg.pose = self._pose_from_goal(
+        self._cached_contact_r_xyz,
+        self._quat_for_viz(
+          self._cached_contact_r_xyz, self._cached_contact_r_quat, 'r'
+        ),
+      )
+      self._target_contact_pose_r_pub.publish(contact_r_msg)
 
   def _wait_curobo(self, timeout_sec: float = 120.0) -> bool:
     deadline = time.monotonic() + timeout_sec
@@ -901,15 +1139,29 @@ class CuRoboPathPlanningNode(Node):
       return False
     if not self._wait_action_server(self._execute, 'ExecuteTrajectory'):
       return False
-    js_timeout = float(self.get_parameter('wait_for_joint_states_sec').value)
-    if not self._wait_for_joint_states(js_timeout):
-      self.get_logger().error(
-        'No joint_states received (check follower bringup and joint_state QoS).'
-      )
+    if (
+      bool(self.get_parameter('enable_final_tool_approach').value)
+      and bool(self.get_parameter('final_approach_use_move_group').value)
+      and not self._wait_action_server(self._move_group, 'MoveGroup')
+    ):
       return False
+    js_timeout = max(float(self.get_parameter('wait_for_joint_states_sec').value), 0.0)
+    if js_timeout > 0.0 and not self._wait_for_joint_states(js_timeout):
+      msg = (
+        'No /joint_states received yet (check follower bringup, use_sim_time, '
+        'and joint_state QoS; try joint_state_best_effort_qos:=true).'
+      )
+      if bool(self.get_parameter('require_joint_states_at_startup').value):
+        self.get_logger().error(msg)
+        return False
+      self.get_logger().warn(
+        f'{msg} Node keeps running — planning waits for /joint_states.'
+      )
     return True
 
   def _wait_for_joint_states(self, timeout_sec: float) -> bool:
+    if self._latest_joint_state is not None:
+      return True
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
       if self._latest_joint_state is not None:
@@ -1022,8 +1274,13 @@ class CuRoboPathPlanningNode(Node):
     )
 
   def _on_joint_states(self, msg: JointState) -> None:
+    first = self._latest_joint_state is None
     self._latest_joint_state = msg
     self._latest_joint_state_mono = time.monotonic()
+    if first:
+      self.get_logger().info(
+        f'Received /joint_states ({len(msg.name)} joints).'
+      )
     # Detect ROS-time mismatch (e.g., use_sim_time mismatch or stale timestamps).
     stamp = msg.header.stamp
     stamp_sec = float(stamp.sec) + float(stamp.nanosec) * 1e-9
@@ -1179,6 +1436,29 @@ class CuRoboPathPlanningNode(Node):
       return dq > 1e-3
     return False
 
+  def _contact_pose_changed(
+    self,
+    xyz: tuple[float, float, float],
+    quat: Quaternion,
+    arm: str,
+  ) -> bool:
+    if arm == 'l':
+      prev_xyz, prev_quat = self._cached_contact_l_xyz, self._cached_contact_l_quat
+    else:
+      prev_xyz, prev_quat = self._cached_contact_r_xyz, self._cached_contact_r_quat
+    if prev_xyz is None or prev_quat is None:
+      return True
+    eps = self._goal_pose_epsilon()
+    if math.dist(xyz, prev_xyz) > eps:
+      return True
+    dq = (
+      abs(float(prev_quat.w) - float(quat.w))
+      + abs(float(prev_quat.x) - float(quat.x))
+      + abs(float(prev_quat.y) - float(quat.y))
+      + abs(float(prev_quat.z) - float(quat.z))
+    )
+    return dq > 1e-3
+
   def _update_goal_from_pose(
     self, msg: PoseStamped, arm: str, reason_suffix: str
   ) -> None:
@@ -1199,8 +1479,10 @@ class CuRoboPathPlanningNode(Node):
       self._cached_goal_r_quat = quat
       self._goal_r_ready = True
       label = 'Right'
-    self.get_logger().info(
-      f'{label} goal updated: xyz={xyz} ({self._orientation_mode_log_label()})'
+    self._motion_log(
+      'cuRobo',
+      arm,
+      f'goal updated (pre-grasp /target_pose): xyz=({xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f})',
     )
     self._publish_target_visualization()
     if self._planning_mode == 'dual':
@@ -1229,6 +1511,39 @@ class CuRoboPathPlanningNode(Node):
 
   def _on_goal_pose_r(self, msg: PoseStamped) -> None:
     self._update_goal_from_pose(msg, 'r', 'goal_pose_r')
+
+  def _update_contact_from_pose(self, msg: PoseStamped, arm: str) -> None:
+    xyz, quat_wxyz = self._goal_from_pose_stamped(msg)
+    quat = self._quat_from_wxyz_tuple(quat_wxyz)
+    if not self._contact_pose_changed(xyz, quat, arm):
+      return
+    if arm == 'l':
+      self._cached_contact_l_xyz = xyz
+      self._cached_contact_l_quat = quat
+    else:
+      self._cached_contact_r_xyz = xyz
+      self._cached_contact_r_quat = quat
+    approach_xyz = self._goal_xyz_for_arm(arm)
+    approach_note = ''
+    if approach_xyz is not None:
+      dist = math.dist(approach_xyz, xyz)
+      approach_note = (
+        f', offset from cuRobo goal={dist:.3f}m '
+        f'(approach=({approach_xyz[0]:.3f},{approach_xyz[1]:.3f},{approach_xyz[2]:.3f}))'
+      )
+    self._motion_log(
+      'MoveIt',
+      arm,
+      f'contact goal updated (/target_pose_contact): '
+      f'xyz=({xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f}){approach_note}',
+    )
+    self._publish_target_visualization()
+
+  def _on_goal_contact_l(self, msg: PoseStamped) -> None:
+    self._update_contact_from_pose(msg, 'l')
+
+  def _on_goal_contact_r(self, msg: PoseStamped) -> None:
+    self._update_contact_from_pose(msg, 'r')
 
   def _call_apply_planning_scene(self, scene) -> bool:
     req = ApplyPlanningScene.Request()
@@ -1342,6 +1657,44 @@ class CuRoboPathPlanningNode(Node):
     if detail:
       msg += f' | {detail}'
     self.get_logger().info(msg)
+
+  @staticmethod
+  def _arm_tag(arm: str) -> str:
+    return 'LEFT' if str(arm).lower() == 'l' else 'RIGHT'
+
+  def _motion_log(self, channel: str, arm: Optional[str], message: str, *, level: str = 'info') -> None:
+    """Structured motion log: channel=cuRobo|MoveIt|RViz, arm=l|r|None."""
+    tag = f'[{channel}'
+    if arm is not None:
+      tag += f'/{self._arm_tag(arm)}'
+    tag += ']'
+    full = f'{tag} {message}'
+    if level == 'warn':
+      self.get_logger().warn(full)
+    elif level == 'error':
+      self.get_logger().error(full)
+    else:
+      self.get_logger().info(full)
+
+  def _resolve_final_approach_arm(self, step_label: str) -> Optional[str]:
+    """Arm for MoveIt STAGE 2 after cuRobo coarse execute."""
+    low = step_label.lower()
+    if 'lift' in low and 'left' not in low and 'right' not in low:
+      return None
+    if 'left' in low:
+      return 'l'
+    if 'right' in low:
+      return 'r'
+    if self._planning_mode == 'left':
+      return 'l'
+    if self._planning_mode == 'right':
+      return 'r'
+    return None
+
+  def _goal_xyz_for_arm(self, arm: str) -> Optional[tuple[float, float, float]]:
+    if arm == 'l':
+      return self._cached_goal_l_xyz
+    return self._cached_goal_r_xyz
 
   @staticmethod
   def _plan_response_summary(plan: dict) -> str:
@@ -1484,6 +1837,12 @@ class CuRoboPathPlanningNode(Node):
           )
     if not bool(self.get_parameter('auto_plan').value):
       missing.append('auto_plan:=true')
+    js_topic = str(self.get_parameter('joint_state_topic').value)
+    if self._latest_joint_state is None:
+      missing.append(js_topic)
+    elif not self._joint_state_is_fresh():
+      age = time.monotonic() - self._latest_joint_state_mono
+      missing.append(f'{js_topic} (stale {age:.1f}s)')
     if missing:
       return False, ', '.join(missing)
     return True, 'ready'
@@ -1747,9 +2106,12 @@ class CuRoboPathPlanningNode(Node):
     target = payload.get('target_pose', {}).get('position', [])
     robot = payload.get('robot_file', '?')
     n_obs = len(payload.get('obstacles') or [])
-    self._plan_progress(
-      f'cuRobo /plan request ({arm_label})',
-      f'robot={robot}, target={[round(float(x), 3) for x in target]}, obstacles={n_obs}',
+    arm = self._resolve_final_approach_arm(arm_label)
+    self._motion_log(
+      'cuRobo',
+      arm,
+      f'STAGE 1 planning HTTP /plan: robot={robot}, '
+      f'pre-grasp target={[round(float(x), 3) for x in target]}, obstacles={n_obs}',
     )
     t0 = time.monotonic()
     try:
@@ -2763,6 +3125,488 @@ class CuRoboPathPlanningNode(Node):
       return None
     return self._plan_dict_to_trajectory(plan)
 
+  @staticmethod
+  def _quat_from_wxyz_tuple(wxyz: tuple[float, float, float, float]) -> Quaternion:
+    w, x, y, z = wxyz
+    q = Quaternion()
+    q.w, q.x, q.y, q.z = float(w), float(x), float(y), float(z)
+    return q
+
+  def _arm_for_final_approach_step(self, step_label: str) -> Optional[str]:
+    return self._resolve_final_approach_arm(step_label)
+
+  def _wait_before_final_approach(self, arm: str, step_label: str) -> None:
+    settle = max(float(self.get_parameter('final_approach_settle_sec').value), 0.0)
+    if settle <= 0.0:
+      return
+    self._motion_log(
+      'MoveIt',
+      arm,
+      f'STAGE 2 pause {settle:.1f}s after cuRobo ({step_label or "coarse"}) — '
+      'watch robot hold pre-grasp before contact move',
+    )
+    time.sleep(settle)
+
+  def _lookup_ee_xyz(self, ee_link: str) -> Optional[tuple[float, float, float]]:
+    timeout = max(float(self.get_parameter('final_approach_tf_timeout_sec').value), 0.1)
+    try:
+      tfm = self._tf_buffer.lookup_transform(
+        self._planning_frame,
+        ee_link,
+        rclpy.time.Time(),
+        timeout=Duration(seconds=timeout),
+      )
+      t = tfm.transform.translation
+      return float(t.x), float(t.y), float(t.z)
+    except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+      self.get_logger().warn(
+        f'EE TF lookup failed ({self._planning_frame} <- {ee_link}): {e}',
+        throttle_duration_sec=5.0,
+      )
+      return None
+
+  def _contact_pose_for_arm(
+    self, arm: str
+  ) -> tuple[Optional[tuple[float, float, float]], Optional[Quaternion]]:
+    if arm == 'l':
+      return self._cached_contact_l_xyz, self._cached_contact_l_quat
+    return self._cached_contact_r_xyz, self._cached_contact_r_quat
+
+  def _contact_pose_goal_constraints(
+    self,
+    contact_xyz: tuple[float, float, float],
+    quat: Quaternion,
+    ee_link: str,
+  ) -> Constraints:
+    tol = max(float(self.get_parameter('final_approach_goal_tolerance_m').value), 0.001)
+    sphere = SolidPrimitive()
+    sphere.type = SolidPrimitive.SPHERE
+    sphere.dimensions = [tol]
+
+    target = Pose()
+    target.position.x = float(contact_xyz[0])
+    target.position.y = float(contact_xyz[1])
+    target.position.z = float(contact_xyz[2])
+    target.orientation = quat
+
+    bv = BoundingVolume()
+    bv.primitives.append(sphere)
+    bv.primitive_poses.append(target)
+
+    pc = PositionConstraint()
+    pc.header.frame_id = self._planning_frame
+    pc.header.stamp = self.get_clock().now().to_msg()
+    pc.link_name = ee_link
+    pc.target_point_offset = Vector3(x=0.0, y=0.0, z=0.0)
+    pc.constraint_region = bv
+    pc.weight = 1.0
+
+    oc = OrientationConstraint()
+    oc.header.frame_id = self._planning_frame
+    oc.header.stamp = self.get_clock().now().to_msg()
+    oc.link_name = ee_link
+    oc.orientation = quat
+    oc.absolute_x_axis_tolerance = 0.12
+    oc.absolute_y_axis_tolerance = 0.12
+    oc.absolute_z_axis_tolerance = 0.12
+    oc.weight = 1.0
+
+    goal_c = Constraints()
+    goal_c.position_constraints.append(pc)
+    goal_c.orientation_constraints.append(oc)
+    return goal_c
+
+  def _call_move_group_plan(
+    self,
+    request: MotionPlanRequest,
+    arm: str,
+    *,
+    preview: bool = False,
+  ) -> Optional[RobotTrajectory]:
+    if not self._move_group.server_is_ready():
+      return None
+    goal = MoveGroup.Goal()
+    goal.request = request
+    goal.planning_options = PlanningOptions()
+    goal.planning_options.plan_only = True
+    goal.planning_options.look_around = False
+    goal.planning_options.replan = False
+
+    send_future = self._move_group.send_goal_async(goal)
+    if not self._wait_future_done(send_future, timeout_sec=30.0):
+      return None
+    gh = send_future.result()
+    if gh is None or not gh.accepted:
+      if not preview:
+        self._motion_log('MoveIt', arm, 'STAGE 2 MoveGroup goal rejected', level='error')
+      return None
+
+    result_future = gh.get_result_async()
+    if not self._wait_future_done(result_future, timeout_sec=120.0):
+      return None
+    wrapped = result_future.result()
+    if wrapped is None:
+      return None
+    result = wrapped.result
+    if int(result.error_code.val) != int(MoveItErrorCodes.SUCCESS):
+      if not preview:
+        self._motion_log(
+          'MoveIt',
+          arm,
+          f'STAGE 2 MoveGroup plan failed: val={result.error_code.val}',
+          level='error',
+        )
+      return None
+    traj = result.planned_trajectory
+    if not traj.joint_trajectory.points:
+      return None
+    return traj
+
+  def _build_final_approach_waypoints(
+    self,
+    from_xyz: tuple[float, float, float],
+    contact_xyz: tuple[float, float, float],
+    quat: Quaternion,
+    steps: int,
+  ) -> List[Pose]:
+    """Cartesian fallback: straight line from start EE position to contact goal."""
+    ax, ay, az = from_xyz
+    cx, cy, cz = contact_xyz
+    seg_dx = cx - ax
+    seg_dy = cy - ay
+    seg_dz = cz - az
+    seg_len = math.sqrt(seg_dx * seg_dx + seg_dy * seg_dy + seg_dz * seg_dz)
+    if seg_len <= 1e-6:
+      wp = Pose()
+      wp.position.x = cx
+      wp.position.y = cy
+      wp.position.z = cz
+      wp.orientation = quat
+      return [wp]
+    waypoints: List[Pose] = []
+    for i in range(1, steps + 1):
+      t = float(i) / float(steps)
+      wp = Pose()
+      wp.position.x = ax + t * seg_dx
+      wp.position.y = ay + t * seg_dy
+      wp.position.z = az + t * seg_dz
+      wp.orientation = quat
+      waypoints.append(wp)
+    return waypoints
+
+  def _plan_final_cartesian_to_contact(
+    self,
+    arm: str,
+    contact_xyz: tuple[float, float, float],
+    quat: Quaternion,
+    from_xyz: tuple[float, float, float],
+    *,
+    start_joint_state: Optional[JointState] = None,
+    preview: bool = False,
+  ) -> Optional[RobotTrajectory]:
+    group_name = 'arm_r' if arm == 'r' else 'arm_l'
+    ee_link = DEFAULT_EE_LINK_R if arm == 'r' else DEFAULT_EE_LINK_L
+    steps = max(int(self.get_parameter('final_approach_steps').value), 1)
+    waypoints = self._build_final_approach_waypoints(
+      from_xyz, contact_xyz, quat, steps
+    )
+    if not waypoints:
+      return None
+    max_step = max(float(self.get_parameter('final_approach_max_step').value), 0.001)
+    if not self._cartesian_path_cli.service_is_ready():
+      return None
+
+    req = GetCartesianPath.Request()
+    req.header.frame_id = self._planning_frame
+    req.header.stamp = self.get_clock().now().to_msg()
+    req.start_state = RobotState()
+    if start_joint_state is not None:
+      req.start_state.joint_state = start_joint_state
+    elif self._latest_joint_state is not None:
+      req.start_state.joint_state = self._latest_joint_state
+    req.group_name = group_name
+    req.link_name = ee_link
+    req.waypoints = waypoints
+    req.max_step = max_step
+    req.jump_threshold = 0.0
+    req.prismatic_jump_threshold = 0.0
+    req.revolute_jump_threshold = 0.0
+    req.avoid_collisions = True
+
+    fut = self._cartesian_path_cli.call_async(req)
+    if not self._wait_future_done(fut, timeout_sec=60.0):
+      return None
+    resp = fut.result()
+    if resp is None:
+      return None
+    if int(resp.error_code.val) != int(MoveItErrorCodes.SUCCESS):
+      if not preview:
+        self._motion_log(
+          'MoveIt',
+          arm,
+          f'STAGE 2 Cartesian failed: val={resp.error_code.val} fraction={resp.fraction}',
+          level='error',
+        )
+      return None
+    if float(resp.fraction) <= 0.0 or not resp.solution.joint_trajectory.points:
+      return None
+    if float(resp.fraction) < 0.99 and not preview:
+      self._motion_log(
+        'MoveIt',
+        arm,
+        f'STAGE 2 Cartesian incomplete: fraction={resp.fraction}',
+        level='warn',
+      )
+    return resp.solution
+
+  def _robot_state_from_trajectory_end(
+    self, traj: RobotTrajectory
+  ) -> Optional[RobotState]:
+    jt = traj.joint_trajectory
+    if not jt.points:
+      return None
+    end = jt.points[-1]
+    state = RobotState()
+    if self._latest_joint_state is not None:
+      js = JointState()
+      js.header = self._latest_joint_state.header
+      js.name = list(self._latest_joint_state.name)
+      js.position = [float(p) for p in self._latest_joint_state.position]
+      traj_idx = {n: i for i, n in enumerate(jt.joint_names)}
+      for i, name in enumerate(js.name):
+        if name in traj_idx:
+          js.position[i] = float(end.positions[traj_idx[name]])
+      state.joint_state = js
+      return state
+    js = JointState()
+    js.name = list(jt.joint_names)
+    js.position = [float(p) for p in end.positions]
+    state.joint_state = js
+    return state
+
+  def _plan_final_tool_approach_trajectory(
+    self,
+    arm: str,
+    *,
+    start_joint_state: Optional[JointState] = None,
+    preview_from_approach: bool = False,
+    step_label: str = '',
+  ) -> Optional[RobotTrajectory]:
+    if not bool(self.get_parameter('enable_final_tool_approach').value):
+      return None
+
+    contact_xyz, quat_raw = self._contact_pose_for_arm(arm)
+    approach_xyz = self._goal_xyz_for_arm(arm)
+    if contact_xyz is None or quat_raw is None:
+      return None
+    quat = quat_raw if isinstance(quat_raw, Quaternion) else self._quat_from_wxyz_tuple(quat_raw)
+    group_name = 'arm_r' if arm == 'r' else 'arm_l'
+    ee_link = DEFAULT_EE_LINK_R if arm == 'r' else DEFAULT_EE_LINK_L
+    goal_tol = max(float(self.get_parameter('final_approach_goal_tolerance_m').value), 0.001)
+    max_dist = max(float(self.get_parameter('final_approach_max_distance_m').value), 0.01)
+    vscale = max(
+      min(float(self.get_parameter('final_approach_velocity_scale').value), 1.0),
+      0.01,
+    )
+
+    if preview_from_approach:
+      if approach_xyz is None:
+        return None
+      from_xyz = approach_xyz
+      dist_to_contact = math.dist(from_xyz, contact_xyz)
+    else:
+      ee_xyz = self._lookup_ee_xyz(ee_link)
+      if ee_xyz is None:
+        return None
+      from_xyz = ee_xyz
+      dist_to_contact = math.dist(ee_xyz, contact_xyz)
+      dist_to_approach = (
+        math.dist(ee_xyz, approach_xyz) if approach_xyz is not None else float('nan')
+      )
+      self._motion_log(
+        'MoveIt',
+        arm,
+        f'STAGE 2 check ({step_label or "final"}): EE=({ee_xyz[0]:.3f},{ee_xyz[1]:.3f},'
+        f'{ee_xyz[2]:.3f}) → contact=({contact_xyz[0]:.3f},{contact_xyz[1]:.3f},'
+        f'{contact_xyz[2]:.3f}), remain={dist_to_contact:.3f}m '
+        f'(max {max_dist:.2f}m), dist EE→cuRobo goal={dist_to_approach:.3f}m',
+      )
+      if dist_to_contact > max_dist:
+        self._motion_log(
+          'MoveIt',
+          arm,
+          f'STAGE 2 skipped: EE too far from contact ({dist_to_contact:.3f}m > '
+          f'{max_dist:.3f}m)',
+          level='warn',
+        )
+        return None
+
+    if dist_to_contact <= goal_tol:
+      return None
+
+    self._motion_log(
+      'MoveIt',
+      arm,
+      f'STAGE 2 goal = clicked contact pose '
+      f'({contact_xyz[0]:.3f},{contact_xyz[1]:.3f},{contact_xyz[2]:.3f}) '
+      f'from current EE (remain {dist_to_contact:.3f}m)',
+    )
+
+    traj: Optional[RobotTrajectory] = None
+    if bool(self.get_parameter('final_approach_use_move_group').value):
+      req = MotionPlanRequest()
+      req.group_name = group_name
+      req.num_planning_attempts = max(
+        int(self.get_parameter('final_approach_planning_attempts').value), 1
+      )
+      req.allowed_planning_time = max(
+        float(self.get_parameter('final_approach_planning_time').value), 1.0
+      )
+      req.max_velocity_scaling_factor = vscale
+      req.max_acceleration_scaling_factor = vscale
+      req.goal_constraints = [
+        self._contact_pose_goal_constraints(contact_xyz, quat, ee_link)
+      ]
+      if start_joint_state is not None:
+        req.start_state = RobotState()
+        req.start_state.joint_state = start_joint_state
+      elif self._latest_joint_state is not None:
+        req.start_state = RobotState()
+        req.start_state.joint_state = self._latest_joint_state
+      traj = self._call_move_group_plan(
+        req, arm, preview=preview_from_approach
+      )
+      if traj is not None:
+        self._motion_log('MoveIt', arm, 'STAGE 2 MoveGroup plan OK → contact pose')
+
+    if traj is None:
+      self._motion_log(
+        'MoveIt',
+        arm,
+        'STAGE 2 Cartesian fallback → contact pose',
+      )
+      traj = self._plan_final_cartesian_to_contact(
+        arm,
+        contact_xyz,
+        quat,
+        from_xyz,
+        start_joint_state=start_joint_state,
+        preview=preview_from_approach,
+      )
+
+    return traj
+
+  def _append_final_approach_display_previews(
+    self,
+    display: DisplayTrajectory,
+    prepared: List[tuple[RobotTrajectory, str]],
+    vscale: float,
+  ) -> int:
+    if not bool(self.get_parameter('enable_final_tool_approach').value):
+      return 0
+    min_sec = 1.0
+    added = 0
+    for traj, step_label in prepared:
+      arm = self._resolve_final_approach_arm(step_label)
+      if arm is None:
+        continue
+      start_state = self._robot_state_from_trajectory_end(traj)
+      if start_state is None:
+        continue
+      preview = self._plan_final_tool_approach_trajectory(
+        arm,
+        start_joint_state=start_state.joint_state,
+        preview_from_approach=True,
+        step_label=step_label,
+      )
+      if preview is None:
+        self._motion_log(
+          'RViz',
+          arm,
+          f'STAGE 2 preview unavailable for {step_label} '
+          '(GetCartesianPath failed — contact segment not shown)',
+          level='warn',
+        )
+        continue
+      self._scale_trajectory_speed(preview, vscale)
+      self._enforce_min_trajectory_duration(preview, min_sec)
+      display.trajectory.append(preview)
+      added += 1
+      jt = preview.joint_trajectory
+      dur = self._traj_point_time_sec(jt.points[-1]) if jt.points else 0.0
+      self._motion_log(
+        'RViz',
+        arm,
+        f'STAGE 2 contact approach preview appended ({step_label}, '
+        f'{len(jt.points)} pts, duration≈{dur:.2f}s)',
+      )
+    return added
+
+  def _execute_final_tool_approach(self, arm: str, step_label: str = '') -> bool:
+    if not bool(self.get_parameter('enable_final_tool_approach').value):
+      self._motion_log('MoveIt', arm, 'STAGE 2 skipped (enable_final_tool_approach:=false)')
+      return True
+    contact_xyz, quat_raw = self._contact_pose_for_arm(arm)
+    if contact_xyz is None or quat_raw is None:
+      self._motion_log(
+        'MoveIt',
+        arm,
+        'STAGE 2 skipped: contact pose missing — publish /target_pose_contact* '
+        'from perception_click_planning',
+        level='warn',
+      )
+      return True
+
+    traj = self._plan_final_tool_approach_trajectory(
+      arm, preview_from_approach=False, step_label=step_label
+    )
+    if traj is None:
+      ee_link = DEFAULT_EE_LINK_R if arm == 'r' else DEFAULT_EE_LINK_L
+      ee_xyz = self._lookup_ee_xyz(ee_link)
+      goal_tol = max(float(self.get_parameter('final_approach_goal_tolerance_m').value), 0.001)
+      max_dist = max(float(self.get_parameter('final_approach_max_distance_m').value), 0.01)
+      if (
+        ee_xyz is not None
+        and goal_tol < math.dist(ee_xyz, contact_xyz) <= max_dist
+      ):
+        self._motion_log(
+          'MoveIt',
+          arm,
+          'STAGE 2 failed: could not plan to contact pose',
+          level='error',
+        )
+        return False
+      return True
+
+    n_pts = len(traj.joint_trajectory.points)
+    dur = 0.0
+    if n_pts:
+      dur = self._traj_point_time_sec(traj.joint_trajectory.points[-1])
+    self._motion_log(
+      'MoveIt',
+      arm,
+      f'STAGE 2 path ready: {n_pts} pts, duration≈{dur:.2f}s',
+    )
+    vscale = max(
+      min(float(self.get_parameter('final_approach_velocity_scale').value), 1.0),
+      0.01,
+    )
+    self._scale_trajectory_speed(traj, vscale)
+    self._enforce_min_trajectory_duration(traj, 1.0)
+    self._publish_display_trajectory(traj, motion_arm=arm, stage=2)
+    self._prepend_trajectory_start_state(traj)
+    t0 = time.monotonic()
+    ok = self._execute_trajectory(traj)
+    if ok:
+      self._motion_log(
+        'MoveIt',
+        arm,
+        f'STAGE 2 done: contact reached in {time.monotonic() - t0:.2f}s',
+      )
+    else:
+      self._motion_log('MoveIt', arm, 'STAGE 2 execute failed', level='error')
+    return ok
+
   def _begin_confirm_session(self) -> int:
     self._confirm_session_id += 1
     self._awaiting_confirm = True
@@ -2786,7 +3630,21 @@ class CuRoboPathPlanningNode(Node):
       self._enforce_min_trajectory_duration(
         traj, float(self.get_parameter('min_trajectory_duration_sec').value)
       )
-      self._publish_display_trajectory(traj)
+      arm = self._resolve_final_approach_arm(label)
+      display_trajs: List[RobotTrajectory] = [traj]
+      start_state = self._robot_state_from_trajectory_end(traj)
+      if arm is not None and start_state is not None:
+        preview = self._plan_final_tool_approach_trajectory(
+          arm,
+          start_joint_state=start_state.joint_state,
+          preview_from_approach=True,
+          step_label=label,
+        )
+        if preview is not None:
+          self._scale_trajectory_speed(preview, vscale)
+          self._enforce_min_trajectory_duration(preview, 1.0)
+          display_trajs.append(preview)
+      self._publish_display_trajectories(display_trajs, motion_arm=arm, label=label)
       need_confirm = (
         bool(self.get_parameter('confirm_before_execute').value)
         if require_confirm is None
@@ -2794,6 +3652,12 @@ class CuRoboPathPlanningNode(Node):
       )
       if need_confirm:
         confirm_topic = str(self.get_parameter('execute_confirm_topic').value).strip()
+        arm = self._resolve_final_approach_arm(label)
+        self._motion_log(
+          'RViz',
+          arm,
+          f'STAGE 1 path shown — confirm before cuRobo coarse execute (label={label})',
+        )
         self._plan_progress(
           'awaiting confirm',
           f'label={label}, velocity={vscale * 100:.0f}% — check RViz then confirm',
@@ -2803,6 +3667,12 @@ class CuRoboPathPlanningNode(Node):
           f'    ros2 topic pub --once {confirm_topic} std_msgs/msg/Empty "{{}}"'
         )
       else:
+        arm = self._resolve_final_approach_arm(label)
+        self._motion_log(
+          'cuRobo',
+          arm,
+          f'STAGE 1 auto-execute coarse path (label={label}, velocity={vscale * 100:.0f}%)',
+        )
         self._plan_progress(
           'auto execute',
           f'label={label}, velocity={vscale * 100:.0f}% (no confirm)',
@@ -2815,14 +3685,31 @@ class CuRoboPathPlanningNode(Node):
           self.get_logger().info('Execution skipped.')
         return False
 
-      self._plan_progress('executing', f'label={label}, sending ExecuteTrajectory to MoveIt')
+      arm = self._resolve_final_approach_arm(label)
+      self._motion_log(
+        'cuRobo',
+        arm,
+        f'STAGE 1 executing coarse trajectory (label={label})',
+      )
       t0 = time.monotonic()
       if self._execute_trajectory(traj):
         self._last_plan_mono = time.monotonic()
-        self._plan_progress(
-          'execute done',
-          f'label={label}, elapsed={time.monotonic() - t0:.2f}s',
+        self._motion_log(
+          'cuRobo',
+          arm,
+          f'STAGE 1 done in {time.monotonic() - t0:.2f}s (label={label})',
         )
+        if arm is not None:
+          self._wait_joint_states_after_move(f'after {label}')
+          self._wait_before_final_approach(arm, label)
+          if not self._execute_final_tool_approach(arm, label):
+            return False
+        elif self._planning_mode == 'dual':
+          for final_arm, final_label in (('l', 'left arm'), ('r', 'right arm')):
+            self._wait_joint_states_after_move(f'after {final_label}')
+            self._wait_before_final_approach(final_arm, final_label)
+            if not self._execute_final_tool_approach(final_arm, final_label):
+              return False
         return True
       self._plan_progress(
         'execute failed',
@@ -2866,14 +3753,22 @@ class CuRoboPathPlanningNode(Node):
         display.trajectory_start = start
       for traj, _ in prepared:
         display.trajectory.append(traj)
+      preview_count = self._append_final_approach_display_previews(
+        display, prepared, vscale
+      )
       count = max(1, int(self.get_parameter('display_path_publish_count').value))
       for _ in range(count):
         self._display_path_pub.publish(display)
         time.sleep(0.05)
       step_summary = ' → '.join(label for _, label in prepared)
       self.get_logger().info(
-        f'Planned path sequence ({len(prepared)} segments) for RViz: {step_summary}'
+        f'[RViz] STAGE 1 path sequence ({len(prepared)} segments): {step_summary}'
       )
+      if preview_count > 0:
+        self.get_logger().info(
+          f'[RViz] STAGE 2 contact approach preview ({preview_count} segment(s)) '
+          f'appended — pre-grasp → contact on {self._display_path_pub.topic_name}'
+        )
 
       need_confirm = (
         bool(self.get_parameter('confirm_before_execute').value)
@@ -2903,37 +3798,91 @@ class CuRoboPathPlanningNode(Node):
           self.get_logger().info('Execution skipped.')
         return False
 
+      self.get_logger().info(
+        f'[EXEC] sequence start ({len(prepared)} cuRobo steps): {step_summary}'
+      )
+
+      stage2_queue: List[tuple[str, str]] = []
       for idx, (traj, step_label) in enumerate(prepared):
         if idx > 0 and not self._wait_joint_states_after_move(
-          f'before step {idx + 1}/{len(prepared)} ({step_label})'
+          f'before STAGE 1 step {idx + 1}/{len(prepared)} ({step_label})'
         ):
           self._plan_progress(
             'failed',
             f'no /joint_states before {step_label}',
           )
           return False
-        self._plan_progress(
-          'executing',
-          f'step {idx + 1}/{len(prepared)}: {step_label}',
+        arm = self._resolve_final_approach_arm(step_label)
+        self._motion_log(
+          'cuRobo',
+          arm,
+          f'STAGE 1 executing step {idx + 1}/{len(prepared)}: {step_label}',
         )
         t0 = time.monotonic()
         if not self._execute_trajectory(traj):
           self._plan_progress(
             'execute failed',
-            f'step {idx + 1}/{len(prepared)}: {step_label}',
+            f'STAGE 1 step {idx + 1}/{len(prepared)}: {step_label}',
           )
           return False
-        self._plan_progress(
-          'execute done',
-          f'step {idx + 1}/{len(prepared)}: {step_label}, '
+        self._motion_log(
+          'cuRobo',
+          arm,
+          f'STAGE 1 step {idx + 1}/{len(prepared)} done: {step_label}, '
           f'elapsed={time.monotonic() - t0:.2f}s',
         )
+        if arm is not None:
+          stage2_queue.append((arm, step_label))
         if idx + 1 < len(prepared):
           self._wait_joint_states_after_move(
-            f'after step {idx + 1}/{len(prepared)} ({step_label})'
+            f'after STAGE 1 step {idx + 1}/{len(prepared)} ({step_label})'
           )
 
+      if stage2_queue:
+        stage2_summary = ' → '.join(label for _, label in stage2_queue)
+        self.get_logger().info(
+          f'[EXEC] STAGE 2 phase ({len(stage2_queue)} arms, matches RViz order): '
+          f'{stage2_summary}'
+        )
+        if not self._wait_joint_states_after_move('before STAGE 2 phase'):
+          self._plan_progress('failed', 'no /joint_states before STAGE 2 phase')
+          return False
+        self._wait_before_final_approach(stage2_queue[0][0], 'STAGE 2 phase')
+        for sidx, (arm, step_label) in enumerate(stage2_queue):
+          if sidx > 0:
+            if not self._wait_joint_states_after_move(
+              f'before STAGE 2 step {sidx + 1}/{len(stage2_queue)} ({step_label})'
+            ):
+              self._plan_progress(
+                'failed',
+                f'no /joint_states before MoveIt {step_label}',
+              )
+              return False
+          self._motion_log(
+            'MoveIt',
+            arm,
+            f'STAGE 2 executing {sidx + 1}/{len(stage2_queue)}: {step_label}',
+          )
+          if not self._execute_final_tool_approach(arm, step_label):
+            self._plan_progress(
+              'execute failed',
+              f'MoveIt STAGE 2 after {step_label}',
+            )
+            return False
+          if sidx + 1 < len(stage2_queue):
+            self._wait_joint_states_after_move(
+              f'after STAGE 2 step {sidx + 1}/{len(stage2_queue)} ({step_label})'
+            )
+
       self._last_plan_mono = time.monotonic()
+      self.get_logger().info(
+        f'[EXEC] sequence complete: STAGE 1 ({step_summary})'
+        + (
+          f' → STAGE 2 ({stage2_summary})'
+          if stage2_queue
+          else ''
+        )
+      )
       self._plan_progress('execute done', f'label={exec_label}, all {len(prepared)} steps')
       return True
     finally:
@@ -3053,21 +4002,46 @@ class CuRoboPathPlanningNode(Node):
       f'(was {last_t:.2f}s, factor={factor:.2f})'
     )
 
-  def _publish_display_trajectory(self, traj: RobotTrajectory) -> None:
+  def _publish_display_trajectories(
+    self,
+    trajectories: List[RobotTrajectory],
+    *,
+    motion_arm: Optional[str] = None,
+    label: str = '',
+  ) -> None:
+    if not trajectories:
+      return
     display = DisplayTrajectory()
     display.model_id = str(self.get_parameter('robot_model_id').value)
     if self._latest_joint_state is not None:
       start = RobotState()
       start.joint_state = self._latest_joint_state
       display.trajectory_start = start
-    display.trajectory.append(traj)
+    for traj in trajectories:
+      display.trajectory.append(traj)
     count = max(1, int(self.get_parameter('display_path_publish_count').value))
     for _ in range(count):
       self._display_path_pub.publish(display)
       time.sleep(0.05)
-    self.get_logger().info(
-      'Planned path published for RViz (MotionPlanning → Planned Path, '
-      f'topic {self._display_path_pub.topic_name}).'
+    stage_note = ''
+    if len(trajectories) > 1:
+      stage_note = f' (STAGE 1 + STAGE 2 contact, {len(trajectories)} segments)'
+    elif label:
+      stage_note = f' ({label})'
+    total_pts = sum(len(t.joint_trajectory.points) for t in trajectories)
+    self._motion_log(
+      'RViz',
+      motion_arm,
+      f'planned path → {self._display_path_pub.topic_name}{stage_note}, '
+      f'{total_pts} pts total. MotionPlanning → Planned Path',
+    )
+
+  def _publish_display_trajectory(
+    self, traj: RobotTrajectory, *, motion_arm: Optional[str] = None, stage: int = 1
+  ) -> None:
+    stage_label = 'STAGE 1 coarse' if stage == 1 else 'STAGE 2 contact'
+    self._publish_display_trajectories(
+      [traj], motion_arm=motion_arm, label=stage_label
     )
 
   def _on_execute_confirm(self, _msg: Empty) -> None:
@@ -3077,7 +4051,10 @@ class CuRoboPathPlanningNode(Node):
         throttle_duration_sec=5.0,
       )
       return
-    self.get_logger().info('Execute confirmed via topic.')
+    self.get_logger().info(
+      '[EXEC] confirm received — STAGE 1 all cuRobo steps, then STAGE 2 MoveIt per arm '
+      '(same order as RViz Planned Path)'
+    )
     self._execute_confirm_event.set()
 
   def _wait_for_execute_confirmation(

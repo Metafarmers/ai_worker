@@ -514,3 +514,62 @@ def quat_from_rpy(roll: float, pitch: float, yaw: float) -> Quaternion:
   q.z = cr * cp * sy - sr * sp * cy
   q.w = cr * cp * cy + sr * sp * sy
   return q
+
+
+def quat_rotate_vector(
+  quat: Quaternion,
+  vx: float,
+  vy: float,
+  vz: float,
+) -> Tuple[float, float, float]:
+  """Rotate vector (vx, vy, vz) by unit quaternion quat (vector in base frame)."""
+  x, y, z = float(quat.x), float(quat.y), float(quat.z)
+  w = float(quat.w)
+  tx = 2.0 * (y * vz - z * vy)
+  ty = 2.0 * (z * vx - x * vz)
+  tz = 2.0 * (x * vy - y * vx)
+  return (
+    vx + w * tx + y * tz - z * ty,
+    vy + w * ty + z * tx - x * tz,
+    vz + w * tz + x * ty - y * tx,
+  )
+
+
+def tool_axis_unit_in_base(quat: Quaternion, axis: str = 'z') -> Tuple[float, float, float]:
+  """Unit vector of tool +X/+Y/+Z expressed in planning frame."""
+  key = str(axis).lower().strip()
+  if key == 'x':
+    local = (1.0, 0.0, 0.0)
+  elif key == 'y':
+    local = (0.0, 1.0, 0.0)
+  else:
+    local = (0.0, 0.0, 1.0)
+  return quat_rotate_vector(quat, *local)
+
+
+def offset_along_tool_axis(
+  position_xyz: Tuple[float, float, float],
+  quat: Quaternion,
+  distance_m: float,
+  axis: str = 'z',
+) -> Tuple[float, float, float]:
+  """Translate position by distance_m along +tool axis."""
+  ax, ay, az = tool_axis_unit_in_base(quat, axis)
+  d = float(distance_m)
+  px, py, pz = position_xyz
+  return (px + d * ax, py + d * ay, pz + d * az)
+
+
+def approach_position_from_contact(
+  contact_xyz: Tuple[float, float, float],
+  quat: Quaternion,
+  retreat_tool_m: float,
+  axis: str = 'z',
+) -> Tuple[float, float, float]:
+  """Pre-grasp pose: offset from contact along +tool axis (final move is −axis to contact)."""
+  retreat = max(float(retreat_tool_m), 0.0)
+  if retreat <= 0.0:
+    return contact_xyz
+  ax, ay, az = tool_axis_unit_in_base(quat, axis)
+  cx, cy, cz = contact_xyz
+  return (cx + retreat * ax, cy + retreat * ay, cz + retreat * az)

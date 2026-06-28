@@ -7,8 +7,10 @@ Panels:
         - /MotionPlanning1
         - /Pose1
         - /Pose2
+        - /Pose3
+        - /Pose4
       Splitter Ratio: 0.5
-    Tree Height: 662
+    Tree Height: 679
   - Class: rviz_common/Help
     Name: Help
   - Class: rviz_common/Views
@@ -627,7 +629,7 @@ Visualization Manager:
       Enabled: true
       Name: MarkerArray
       Namespaces:
-        {}
+        obstacle_cuboid: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -688,6 +690,46 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
+    - Alpha: 1
+      Axes Length: 0.10000000149011612
+      Axes Radius: 0.009999999776482582
+      Class: rviz_default_plugins/Pose
+      Color: 255; 25; 0
+      Enabled: true
+      Head Length: 0.30000001192092896
+      Head Radius: 0.10000000149011612
+      Name: Pose
+      Shaft Length: 1
+      Shaft Radius: 0.05000000074505806
+      Shape: Axes
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /curobo_target_pose_contact
+      Value: true
+    - Alpha: 1
+      Axes Length: 0.10000000149011612
+      Axes Radius: 0.009999999776482582
+      Class: rviz_default_plugins/Pose
+      Color: 255; 25; 0
+      Enabled: true
+      Head Length: 0.30000001192092896
+      Head Radius: 0.10000000149011612
+      Name: Pose
+      Shaft Length: 1
+      Shaft Radius: 0.05000000074505806
+      Shape: Axes
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /curobo_target_pose_contact_r
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -706,25 +748,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 4.233097076416016
+      Distance: 1.5223678350448608
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: -0.23425334692001343
-        Y: 0.34320884943008423
-        Z: 0.5991316437721252
+        X: 0.627687931060791
+        Y: -0.1038886159658432
+        Z: 1.2265288829803467
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.3100000023841858
+      Pitch: 0.37000003457069397
       Target Frame: base_link
       Value: Orbit (rviz_default_plugins)
-      Yaw: 3.515185594558716
+      Yaw: 2.5801873207092285
     Saved: ~
 Window Geometry:
   Displays:
@@ -738,7 +780,7 @@ Window Geometry:
     collapsed: true
   MotionPlanning - Trajectory Slider:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd00000001000000000000036a0000075efc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000007000fffffffb000000100044006900730070006c0061007900730000000069000003840000017800fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e006700000003f90000029f0000028e00fffffffb0000000800480065006c0070000000029a0000006e000000cf00fffffffb0000000a0056006900650077007300000006a4000001230000012300ffffff0000073a0000075e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd00000001000000000000036a0000075efc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000007000fffffffb000000100044006900730070006c0061007900730000000069000003950000017800fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e0067000000040a0000028e0000028e00fffffffb0000000800480065006c0070000000029a0000006e000000cf00fffffffb0000000a0056006900650077007300000006a4000001230000012300ffffff0000073a0000075e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: true
   Width: 1850

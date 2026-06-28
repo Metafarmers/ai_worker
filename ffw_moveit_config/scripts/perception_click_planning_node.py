@@ -39,6 +39,7 @@ from curobo_obstacle_utils import (
   TARGET_BACK_WALL_CUROBO_COLLISION_X,
   TARGET_BACK_WALL_ID,
   append_ee_axes_markers,
+  approach_position_from_contact,
   quat_toward_robot_y_up_arm,
   target_back_wall_center_x,
 )
@@ -64,6 +65,8 @@ TARGET_MARKER_ID_AXES_L = 1
 TARGET_MARKER_ID_SPHERE_L = 2
 TARGET_MARKER_ID_AXES_R = 3
 TARGET_MARKER_ID_SPHERE_R = 4
+TARGET_MARKER_ID_CONTACT_L = 5
+TARGET_MARKER_ID_CONTACT_R = 6
 
 
 def _quat_from_yaw(yaw: float):
@@ -105,6 +108,11 @@ class PerceptionClickPlanningNode(Node):
     self.declare_parameter('obstacle_topic', '/obstacle_markers')
     self.declare_parameter('target_pose_topic', '/target_pose')
     self.declare_parameter('target_pose_r_topic', '/target_pose_r')
+    self.declare_parameter('target_pose_contact_topic', '/target_pose_contact')
+    self.declare_parameter('target_pose_contact_r_topic', '/target_pose_contact_r')
+    self.declare_parameter('enable_tool_approach_offset', True)
+    self.declare_parameter('approach_retreat_tool_m', 0.08)
+    self.declare_parameter('approach_tool_axis', 'z')
     self.declare_parameter('publish_target_markers', True)
     self.declare_parameter('target_marker_topic', '/curobo_target_markers')
     self.declare_parameter('min_depth_m', 0.15)
@@ -182,6 +190,13 @@ class PerceptionClickPlanningNode(Node):
     self._target_back_wall_center_y = float(
       self.get_parameter('target_back_wall_center_y').value
     )
+    self._enable_tool_approach_offset = bool(
+      self.get_parameter('enable_tool_approach_offset').value
+    )
+    self._approach_retreat_tool_m = max(
+      float(self.get_parameter('approach_retreat_tool_m').value), 0.0
+    )
+    self._approach_tool_axis = str(self.get_parameter('approach_tool_axis').value).strip().lower()
 
     self._bridge = CvBridge()
     self._data_lock = threading.Lock()
@@ -201,6 +216,8 @@ class PerceptionClickPlanningNode(Node):
     self._target_l: Optional[PlanningClickPoint] = None
     self._target_r: Optional[PlanningClickPoint] = None
     self._next_obstacle_id = 0
+    self._logged_target_key_l: Optional[tuple[float, float, float]] = None
+    self._logged_target_key_r: Optional[tuple[float, float, float]] = None
 
     qos = QoSProfile(
       depth=10,
@@ -238,6 +255,8 @@ class PerceptionClickPlanningNode(Node):
     obstacle_topic = str(self.get_parameter('obstacle_topic').value)
     target_topic = str(self.get_parameter('target_pose_topic').value)
     target_r_topic = str(self.get_parameter('target_pose_r_topic').value)
+    contact_topic = str(self.get_parameter('target_pose_contact_topic').value)
+    contact_r_topic = str(self.get_parameter('target_pose_contact_r_topic').value)
 
     self.create_subscription(Image, image_topic, self._on_image, sensor_qos)
     self.create_subscription(Image, image_topic, self._on_image, reliable_qos)
@@ -248,6 +267,10 @@ class PerceptionClickPlanningNode(Node):
     self._obstacle_pub = self.create_publisher(MarkerArray, obstacle_topic, planning_qos)
     self._target_pose_pub = self.create_publisher(PoseStamped, target_topic, planning_qos)
     self._target_pose_r_pub = self.create_publisher(PoseStamped, target_r_topic, planning_qos)
+    self._target_contact_pub = self.create_publisher(PoseStamped, contact_topic, planning_qos)
+    self._target_contact_r_pub = self.create_publisher(
+      PoseStamped, contact_r_topic, planning_qos
+    )
     if self._publish_target_markers:
       target_marker_topic = str(self.get_parameter('target_marker_topic').value)
       self._target_marker_pub = self.create_publisher(MarkerArray, target_marker_topic, qos)
@@ -274,6 +297,14 @@ class PerceptionClickPlanningNode(Node):
     self.get_logger().info(f'Obstacle CUBE → {obstacle_topic}')
     self.get_logger().info(f'Left target  PoseStamped → {target_topic}')
     self.get_logger().info(f'Right target PoseStamped → {target_r_topic}')
+    self.get_logger().info(f'Left contact  PoseStamped → {contact_topic}')
+    self.get_logger().info(f'Right contact PoseStamped → {contact_r_topic}')
+    if self._enable_tool_approach_offset:
+      self.get_logger().info(
+        f'Tool approach: cuRobo → pre-grasp +{self._approach_retreat_tool_m:.3f}m '
+        f'EE +{self._approach_tool_axis.upper()}; MoveIt final → contact '
+        f'along EE −{self._approach_tool_axis.upper()} when ≤15cm'
+      )
     self.get_logger().info(
       'Keys: 1=left target, 4=right target, 2=obstacle, 3=delete, c=clear, q=quit'
     )
@@ -295,6 +326,8 @@ class PerceptionClickPlanningNode(Node):
       self._target_l = None
       self._target_r = None
       self._next_obstacle_id = 0
+      self._logged_target_key_l = None
+      self._logged_target_key_r = None
     self._publish_obstacles()
     self.get_logger().info('Cleared all targets and obstacles')
 
@@ -382,7 +415,7 @@ class PerceptionClickPlanningNode(Node):
       right_roll_rad=float(self.get_parameter('right_arm_roll_rad').value),
     )
 
-  def _make_target_pose_msg(
+  def _make_contact_pose_msg(
     self, pt: PlanningClickPoint, stamp, arm: Literal['l', 'r'] = 'l'
   ) -> PoseStamped:
     q = self._goal_quat_for_position((pt.x, pt.y, pt.z), arm=arm)
@@ -398,18 +431,57 @@ class PerceptionClickPlanningNode(Node):
     msg.pose.orientation.w = float(q.w)
     return msg
 
+  def _make_approach_pose_msg(
+    self, pt: PlanningClickPoint, stamp, arm: Literal['l', 'r'] = 'l'
+  ) -> PoseStamped:
+    contact = (pt.x, pt.y, pt.z)
+    q = self._goal_quat_for_position(contact, arm=arm)
+    if self._enable_tool_approach_offset and self._approach_retreat_tool_m > 0.0:
+      ax, ay, az = approach_position_from_contact(
+        contact,
+        q,
+        self._approach_retreat_tool_m,
+        axis=self._approach_tool_axis,
+      )
+    else:
+      ax, ay, az = contact
+    msg = PoseStamped()
+    msg.header.stamp = stamp
+    msg.header.frame_id = self._planning_frame
+    msg.pose.position.x = ax
+    msg.pose.position.y = ay
+    msg.pose.position.z = az
+    msg.pose.orientation.x = float(q.x)
+    msg.pose.orientation.y = float(q.y)
+    msg.pose.orientation.z = float(q.z)
+    msg.pose.orientation.w = float(q.w)
+    return msg
+
+  def _make_target_pose_msg(
+    self, pt: PlanningClickPoint, stamp, arm: Literal['l', 'r'] = 'l'
+  ) -> PoseStamped:
+    """cuRobo / planning goal (pre-grasp with tool offset applied)."""
+    return self._make_approach_pose_msg(pt, stamp, arm=arm)
+
   def _make_target_markers(
     self, pt: PlanningClickPoint, stamp, arm: Literal['l', 'r']
   ) -> MarkerArray:
-    pose_msg = self._make_target_pose_msg(pt, stamp, arm=arm)
+    approach_msg = self._make_approach_pose_msg(pt, stamp, arm=arm)
+    contact_msg = self._make_contact_pose_msg(pt, stamp, arm=arm)
     arrow_len = float(self.get_parameter('target_arrow_length').value)
     sphere_d = float(self.get_parameter('target_sphere_diameter').value)
     axes_id = TARGET_MARKER_ID_AXES_L if arm == 'l' else TARGET_MARKER_ID_AXES_R
     sphere_id = TARGET_MARKER_ID_SPHERE_L if arm == 'l' else TARGET_MARKER_ID_SPHERE_R
+    contact_id = TARGET_MARKER_ID_CONTACT_L if arm == 'l' else TARGET_MARKER_ID_CONTACT_R
     color = (
       ColorRGBA(r=0.1, g=0.85, b=0.2, a=0.85)
       if arm == 'l'
       else ColorRGBA(r=0.1, g=0.75, b=1.0, a=0.85)
+    )
+    contact_color = (
+      ColorRGBA(r=0.95, g=0.95, b=0.2, a=0.9)
+      if arm == 'l'
+      else ColorRGBA(r=0.95, g=0.85, b=0.2, a=0.9)
     )
 
     arr = MarkerArray()
@@ -417,25 +489,37 @@ class PerceptionClickPlanningNode(Node):
       arr,
       stamp,
       self._planning_frame,
-      pose_msg.pose,
+      approach_msg.pose,
       ns=TARGET_MARKER_NS,
       marker_id=axes_id,
       axis_length=max(arrow_len, 0.02),
     )
 
-    sphere = Marker()
-    sphere.header = Header(stamp=stamp, frame_id=self._planning_frame)
-    sphere.ns = TARGET_MARKER_NS
-    sphere.id = sphere_id
-    sphere.type = Marker.SPHERE
-    sphere.action = Marker.ADD
-    sphere.pose = pose_msg.pose
-    sphere.scale.x = sphere_d
-    sphere.scale.y = sphere_d
-    sphere.scale.z = sphere_d
-    sphere.color = color
+    approach_sphere = Marker()
+    approach_sphere.header = Header(stamp=stamp, frame_id=self._planning_frame)
+    approach_sphere.ns = TARGET_MARKER_NS
+    approach_sphere.id = sphere_id
+    approach_sphere.type = Marker.SPHERE
+    approach_sphere.action = Marker.ADD
+    approach_sphere.pose = approach_msg.pose
+    approach_sphere.scale.x = sphere_d
+    approach_sphere.scale.y = sphere_d
+    approach_sphere.scale.z = sphere_d
+    approach_sphere.color = color
+    arr.markers.append(approach_sphere)
 
-    arr.markers.append(sphere)
+    contact_sphere = Marker()
+    contact_sphere.header = Header(stamp=stamp, frame_id=self._planning_frame)
+    contact_sphere.ns = TARGET_MARKER_NS
+    contact_sphere.id = contact_id
+    contact_sphere.type = Marker.SPHERE
+    contact_sphere.action = Marker.ADD
+    contact_sphere.pose = contact_msg.pose
+    contact_sphere.scale.x = sphere_d * 0.65
+    contact_sphere.scale.y = sphere_d * 0.65
+    contact_sphere.scale.z = sphere_d * 0.65
+    contact_sphere.color = contact_color
+    arr.markers.append(contact_sphere)
     return arr
 
   def _wall_near_face_x(self, target_x: float) -> float:
@@ -532,13 +616,40 @@ class PerceptionClickPlanningNode(Node):
     if pt is None:
       return
     stamp = self.get_clock().now().to_msg()
-    pose_msg = self._make_target_pose_msg(pt, stamp, arm=arm)
+    approach_msg = self._make_approach_pose_msg(pt, stamp, arm=arm)
+    contact_msg = self._make_contact_pose_msg(pt, stamp, arm=arm)
     if arm == 'l':
-      self._target_pose_pub.publish(pose_msg)
+      self._target_pose_pub.publish(approach_msg)
+      self._target_contact_pub.publish(contact_msg)
+      target_topic = str(self.get_parameter('target_pose_topic').value)
+      contact_topic = str(self.get_parameter('target_pose_contact_topic').value)
     else:
-      self._target_pose_r_pub.publish(pose_msg)
+      self._target_pose_r_pub.publish(approach_msg)
+      self._target_contact_r_pub.publish(contact_msg)
+      target_topic = str(self.get_parameter('target_pose_r_topic').value)
+      contact_topic = str(self.get_parameter('target_pose_contact_r_topic').value)
     if self._target_marker_pub is not None:
       self._target_marker_pub.publish(self._make_target_markers(pt, stamp, arm))
+
+    key = (round(pt.x, 4), round(pt.y, 4), round(pt.z, 4))
+    last_key = self._logged_target_key_l if arm == 'l' else self._logged_target_key_r
+    if key == last_key:
+      return
+    if arm == 'l':
+      self._logged_target_key_l = key
+    else:
+      self._logged_target_key_r = key
+    arm_tag = 'LEFT' if arm == 'l' else 'RIGHT'
+    ap = approach_msg.pose.position
+    cp = contact_msg.pose.position
+    self.get_logger().info(
+      f'[Perception/{arm_tag}] cuRobo → {target_topic} '
+      f'pre-grasp=({ap.x:.3f},{ap.y:.3f},{ap.z:.3f})'
+    )
+    self.get_logger().info(
+      f'[Perception/{arm_tag}] MoveIt → {contact_topic} '
+      f'contact=({cp.x:.3f},{cp.y:.3f},{cp.z:.3f})'
+    )
 
   def _publish_targets(self) -> None:
     self._publish_arm_target('l')
@@ -683,14 +794,13 @@ class PerceptionClickPlanningNode(Node):
           self._target_l = pt
         else:
           self._target_r = pt
-      label = 'Left' if arm == 'l' else 'Right'
-      topic = (
-        self.get_parameter('target_pose_topic').value
-        if arm == 'l'
-        else self.get_parameter('target_pose_r_topic').value
-      )
+      label = 'LEFT' if arm == 'l' else 'RIGHT'
       self.get_logger().info(
-        f'{label} target {self._planning_frame}=({x:.3f}, {y:.3f}, {z:.3f}) → {topic}'
+        f'[Perception/{label}] click contact=({x:.3f},{y:.3f},{z:.3f}) — '
+        f'cuRobo pre-grasp +{self._approach_retreat_tool_m:.3f}m EE+'
+        f'{self._approach_tool_axis.upper()}, MoveIt final → contact'
+        if self._enable_tool_approach_offset and self._approach_retreat_tool_m > 0.0
+        else f'[Perception/{label}] click contact=({x:.3f},{y:.3f},{z:.3f})'
       )
       self._publish_obstacles()
       self._publish_arm_target(arm)
